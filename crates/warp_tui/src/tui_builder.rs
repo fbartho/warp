@@ -217,6 +217,30 @@ impl TuiUiBuilder {
             on_toggle,
         )
     }
+
+    /// Prominent [`tui_collapsible`] variant: a bold primary-text header
+    /// (e.g. the task-list header, which the design renders bold white).
+    /// Since the header is already bold, hover signals with an underline
+    /// instead of the muted collapsible's brighten-on-hover.
+    pub(crate) fn prominent_collapsible(
+        &self,
+        collapsed: bool,
+        label: impl Into<String>,
+        mouse_state: MouseStateHandle,
+        body: Box<dyn TuiElement>,
+        on_toggle: impl FnMut(&mut TuiEventContext, &AppContext) + 'static,
+    ) -> Box<dyn TuiElement> {
+        let header_style = self.primary_text_style().add_modifier(Modifier::BOLD);
+        tui_collapsible(
+            collapsed,
+            label,
+            header_style,
+            header_style.add_modifier(Modifier::UNDERLINED),
+            mouse_state,
+            body,
+            on_toggle,
+        )
+    }
 }
 
 /// Converts a theme fill into a terminal-cell color.

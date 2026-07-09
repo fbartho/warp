@@ -1,18 +1,23 @@
 //! Pure render functions for each agent block section kind.
 //!
-//! Each render function takes a section's data (plus the block's thinking
-//! block states for collapse/hover state) and returns its element. Spacing
+//! Each render function takes a section's data (plus the block's collapsible
+//! section states for collapse/hover state) and returns its element. Spacing
 //! between sections is owned by the composer in `agent_block.rs`, not by these
 //! renderers.
 
 use std::time::Duration;
 
-use warp::tui_export::{format_elapsed_seconds, AIActionStatus, AIAgentAction, MessageId};
-use warpui_core::elements::tui::{TuiContainer, TuiElement, TuiFlex, TuiStyle, TuiText};
+use warp::tui_export::{
+    format_elapsed_seconds, AIActionStatus, AIAgentAction, AIAgentTodo, AIAgentTodoList, MessageId,
+    TodoStatus,
+};
+use warpui_core::elements::tui::{
+    Modifier, TuiContainer, TuiElement, TuiFlex, TuiParentElement, TuiStyle, TuiText,
+};
 use warpui_core::elements::CrossAxisAlignment;
 use warpui_core::AppContext;
 
-use crate::agent_block::ThinkingBlockStates;
+use crate::agent_block::CollapsibleSectionStates;
 use crate::tool_call_labels::{
     tool_call_display_state, tool_call_glyph, tool_call_label, ResolvedCommandBlock,
     ToolCallDisplayState,
@@ -20,6 +25,9 @@ use crate::tool_call_labels::{
 use crate::tui_builder::TuiUiBuilder;
 
 const INPUT_PREFIX: &str = "≫ ";
+
+/// Leading glyph on the task-list header, per the TUI Figma design.
+const TASK_LIST_HEADER_GLYPH: &str = "☰";
 
 /// Renders the input section: the user's submitted query on a highlighted
 /// background with a `≫` prompt marker.
@@ -142,7 +150,7 @@ pub(crate) fn render_fallback_tool_call_section(
 /// Renders a reasoning message as a collapsible thinking block. The header
 /// turns white and bold while the block's hover state reports it hovered.
 pub(crate) fn render_thinking_section(
-    states: &ThinkingBlockStates,
+    states: &CollapsibleSectionStates,
     message_id: &MessageId,
     finished_duration: Option<Duration>,
     body: &str,
@@ -174,4 +182,122 @@ pub(crate) fn render_thinking_section(
             event_ctx.notify();
         },
     )
+}
+
+/// Renders the agent's task list as a collapsible block: a bold
+/// `☰ Tasks N` header (prominent, unlike the muted thinking header, per the
+/// TUI Figma design) over one status row per task. Statuses are resolved by
+/// the caller from the conversation's todo history; like tool-call rows,
+/// state lives in each row's glyph.
+///
+/// Task lists default to expanded and collapse only on manual toggle (the
+/// GUI's `TodoListElementState` behavior), so the default passed to the
+/// state map is never "collapsed" — unlike thinking blocks, which
+/// auto-collapse on finish.
+pub(crate) fn render_todo_list_section(
+    states: &CollapsibleSectionStates,
+    message_id: &MessageId,
+    todos: &[(String, TodoStatus)],
+    app: &AppContext,
+) -> Box<dyn TuiElement> {
+    let builder = TuiUiBuilder::from_app(app);
+    let header = format!("{TASK_LIST_HEADER_GLYPH} Tasks {}", todos.len());
+
+    let mut rows = TuiFlex::column();
+    for (title, status) in todos {
+        let (glyph, glyph_style) = todo_glyph(status, &builder);
+        let title_style = match status {
+            TodoStatus::Pending | TodoStatus::InProgress | TodoStatus::Completed => {
+                builder.primary_text_style()
+            }
+            // Cancelled items are struck through in the GUI; stopped items
+            // just read as de-emphasized.
+            TodoStatus::Cancelled => builder
+                .muted_text_style()
+                .add_modifier(Modifier::CROSSED_OUT),
+            TodoStatus::Stopped => builder.muted_text_style(),
+        };
+        rows.add_child(
+            TuiFlex::row()
+                .child(
+                    TuiText::new(format!("{glyph} "))
+                        .with_style(glyph_style)
+                        .finish(),
+                )
+                .child(TuiText::new(title.clone()).with_style(title_style).finish())
+                .finish(),
+        );
+    }
+    // Indent rows so the status glyphs sit under the header label.
+    let body = TuiContainer::new(rows.finish()).with_padding_left(2);
+
+    let collapsed = states.is_collapsed(message_id, false);
+    let toggle_states = states.clone();
+    let toggle_message_id = message_id.clone();
+    builder.prominent_collapsible(
+        collapsed,
+        header,
+        states.hover_state(message_id),
+        body.finish(),
+        move |event_ctx, _app| {
+            toggle_states.set_collapsed(toggle_message_id.clone(), !collapsed);
+            event_ctx.notify();
+        },
+    )
+}
+
+/// The status glyph and its style for one task row. Pending and in-progress
+/// glyphs follow the TUI Figma design; terminal states reuse the tool-call
+/// glyph vocabulary (see `tool_call_glyph`).
+fn todo_glyph(status: &TodoStatus, builder: &TuiUiBuilder) -> (&'static str, TuiStyle) {
+    match status {
+        TodoStatus::Pending => ("◌", builder.primary_text_style()),
+        TodoStatus::InProgress => ("•", builder.attention_glyph_style()),
+        TodoStatus::Completed => ("✓", builder.success_glyph_style()),
+        TodoStatus::Cancelled | TodoStatus::Stopped => ("■", builder.muted_text_style()),
+    }
+}
+
+/// Renders the compact completion row for todos the agent just marked done:
+/// `✓ Completed <title> (n/m)`, muted like the GUI's sub-text treatment.
+/// `active_list` supplies each item's `(n/m)` position; the position is
+/// omitted for items no longer in the active list.
+pub(crate) fn render_completed_todos_section(
+    completed: &[AIAgentTodo],
+    active_list: Option<&AIAgentTodoList>,
+    app: &AppContext,
+) -> Box<dyn TuiElement> {
+    let builder = TuiUiBuilder::from_app(app);
+    let style = builder.muted_text_style();
+    TuiFlex::row()
+        .child(TuiText::new("✓ ").with_style(style).finish())
+        .child(
+            TuiText::new(completed_todos_label(completed, active_list))
+                .with_style(style)
+                .finish(),
+        )
+        .finish()
+}
+
+/// Builds the `Completed a (1/3), b (2/3)` label text, a port of the GUI's
+/// `render_completed_todo_items` text logic.
+pub(crate) fn completed_todos_label(
+    completed: &[AIAgentTodo],
+    active_list: Option<&AIAgentTodoList>,
+) -> String {
+    let mut label = String::new();
+    for (index, item) in completed.iter().enumerate() {
+        let position = active_list
+            .and_then(|list| {
+                list.get_item_index(&item.id)
+                    .map(|i| format!(" ({}/{})", i + 1, list.len()))
+            })
+            .unwrap_or_default();
+        if index == 0 {
+            label += &format!("Completed {}{position}", item.title);
+        } else {
+            label += &format!(", {}{position}", item.title);
+        }
+    }
+    label
 }
