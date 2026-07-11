@@ -15924,6 +15924,7 @@ dependencies = [
  "strum_macros 0.27.1",
  "sum_tree",
  "tempfile",
+ "unicode-width 0.1.14",
  "vec1",
  "warp",
  "warp_channel_config",
