@@ -5,12 +5,12 @@ use warp_editor::content::buffer::InitialBufferState;
 use warp_editor::model::CoreEditorModel;
 use warpui::EntityIdMap;
 use warpui_core::elements::tui::{
-    TuiBuffer, TuiBufferExt, TuiConstraint, TuiElement, TuiLayoutContext, TuiPaintContext, TuiRect,
-    TuiSize,
+    Color, TuiBuffer, TuiBufferExt, TuiConstraint, TuiElement, TuiLayoutContext, TuiPaintContext,
+    TuiRect, TuiSize, TuiStyle,
 };
 use warpui_core::{App, AppContext, ModelHandle};
 
-use super::TuiEditorElement;
+use super::{TuiEditorElement, TuiEditorStyles};
 
 /// A char-cell editor model seeded with `text`.
 fn model(ctx: &mut AppContext, text: &str) -> ModelHandle<CodeEditorModel> {
@@ -21,14 +21,51 @@ fn model(ctx: &mut AppContext, text: &str) -> ModelHandle<CodeEditorModel> {
     })
 }
 
+#[test]
+fn text_overrides_follow_soft_wrapped_character_ranges() {
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            ctx.add_singleton_model(|_| Appearance::mock());
+            let model = model(ctx, "/plan argument");
+            let styles = TuiEditorStyles {
+                text_overrides: vec![(
+                    CharOffset::zero()..CharOffset::from(5),
+                    TuiStyle::default().fg(Color::Blue),
+                )],
+                ..Default::default()
+            };
+            let element = TuiEditorElement::new(&model, ctx).with_styles(styles);
+            let buffer = render_buffer(ctx, element, 4, 10);
+
+            assert_eq!(buffer[(0, 0)].fg, Color::Blue);
+            assert_eq!(buffer[(3, 0)].fg, Color::Blue);
+            assert_eq!(buffer[(0, 1)].fg, Color::Blue);
+            assert_ne!(buffer[(1, 1)].fg, Color::Blue);
+        });
+    });
+}
+
 /// Lays out and renders `element` into an `area`-sized buffer, returning its
 /// rows trimmed of trailing spaces (blank rows become empty strings).
 fn render_lines(
     ctx: &AppContext,
-    mut element: TuiEditorElement,
+    element: TuiEditorElement,
     width: u16,
     height: u16,
 ) -> Vec<String> {
+    render_buffer(ctx, element, width, height)
+        .to_lines()
+        .into_iter()
+        .map(|line| line.trim_end().to_string())
+        .collect()
+}
+
+fn render_buffer(
+    ctx: &AppContext,
+    mut element: TuiEditorElement,
+    width: u16,
+    height: u16,
+) -> TuiBuffer {
     let mut rendered_views = EntityIdMap::default();
     let mut lctx = TuiLayoutContext {
         rendered_views: &mut rendered_views,
@@ -43,10 +80,6 @@ fn render_lines(
     let mut paint_ctx = TuiPaintContext::new(&mut rendered_views);
     element.render(area, &mut buffer, &mut paint_ctx);
     buffer
-        .to_lines()
-        .into_iter()
-        .map(|line| line.trim_end().to_string())
-        .collect()
 }
 
 #[test]
