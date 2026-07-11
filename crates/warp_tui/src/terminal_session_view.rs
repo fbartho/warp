@@ -10,7 +10,8 @@ use parking_lot::FairMutex;
 use warp::editor::{CodeEditorModel, CodeEditorModelEvent};
 use warp::settings::{AISettings, AISettingsChangedEvent};
 use warp::tui_export::{
-    build_slash_command_mixer, detect_possible_git_repo, record_saved_prompt_accepted,
+    build_slash_command_mixer, conversation_cost_validation_error, detect_possible_git_repo,
+    export_conversation_markdown, record_saved_prompt_accepted,
     record_static_slash_command_accepted, saved_prompt_text_for_id,
     slash_command_is_submitted_as_prompt, slash_command_selection_behavior, slash_commands,
     throttle, AIAgentActionId, AIAgentPtyWriteMode, AcceptSlashCommandOrSavedPrompt, ActiveSession,
@@ -31,6 +32,7 @@ use warp_core::settings::Setting;
 use warp_editor::model::CoreEditorModel;
 use warp_errors::report_error;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
+use warpui::clipboard::ClipboardContent;
 use warpui::SingletonEntity;
 use warpui_core::elements::tui::{
     TuiChildView, TuiConstrainedBox, TuiContainer, TuiElement, TuiFlex, TuiText,
@@ -116,6 +118,22 @@ fn hide_agent_requested_command_from_top_level(
         .set_visibility_of_block_for_ai_action(action_id, false);
     true
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardExportOutcome {
+    Exported,
+    NoActiveConversation,
+}
+
+fn export_markdown_to_clipboard(
+    markdown: Option<String>,
+    clipboard: &mut dyn warpui::Clipboard,
+) -> ClipboardExportOutcome {
+    let Some(markdown) = markdown else {
+        return ClipboardExportOutcome::NoActiveConversation;
+    };
+    clipboard.write(ClipboardContent::plain_text(markdown));
+    ClipboardExportOutcome::Exported
+}
 
 fn raw_prompt_if_not_blank(input: &str) -> Option<&str> {
     (!input.trim().is_empty()).then_some(input)
@@ -141,6 +159,7 @@ pub(crate) struct TuiTerminalSessionView {
     slash_commands_source: ModelHandle<TuiSlashCommandDataSource>,
     conversation_selection: ConversationSelectionHandle,
     ai_controller: ModelHandle<BlocklistAIController>,
+    action_model: ModelHandle<BlocklistAIActionModel>,
     /// Read by the footer for the active session's working directory.
     active_session: ModelHandle<ActiveSession>,
     /// Repository currently containing the active session's working directory.
@@ -452,22 +471,38 @@ impl TuiTerminalSessionView {
                 // `TerminalView::apply_block_metadata_update`). The first
                 // post-bootstrap precmd metadata transitions the cwd from
                 // `None` to `Some`, so this also covers the launch directory.
-                if let Some(cwd) = view
+                let Some(cwd) = view
                     .active_session
                     .as_ref(ctx)
                     .current_working_directory()
                     .cloned()
-                {
-                    let detect_repo = detect_possible_git_repo(
-                        RepoDetectionSessionType::Local,
-                        &cwd,
-                        RepoDetectionSource::TerminalNavigation,
-                        ctx,
-                    );
-                    ctx.spawn(detect_repo, |view, repo_path, ctx| {
-                        view.update_git_status_subscription(repo_path, ctx);
+                else {
+                    view.slash_commands_source.update(ctx, |source, ctx| {
+                        source.set_active_repo_root(None, ctx);
                     });
-                }
+                    view.update_git_status_subscription(None, ctx);
+                    ctx.notify();
+                    return;
+                };
+                let detection = detect_possible_git_repo(
+                    RepoDetectionSessionType::Local,
+                    &cwd,
+                    RepoDetectionSource::TerminalNavigation,
+                    ctx,
+                );
+                ctx.spawn(detection, move |view, repo_path, ctx| {
+                    if view.active_session.as_ref(ctx).current_working_directory() != Some(&cwd) {
+                        return;
+                    }
+                    view.update_git_status_subscription(repo_path.clone(), ctx);
+                    let repo_root = repo_path
+                        .as_ref()
+                        .and_then(|path| path.to_local_path())
+                        .map(ToOwned::to_owned);
+                    view.slash_commands_source.update(ctx, |source, ctx| {
+                        source.set_active_repo_root(repo_root, ctx);
+                    });
+                });
                 ctx.notify();
             }
             ActiveSessionEvent::Bootstrapped => {}
@@ -527,6 +562,7 @@ impl TuiTerminalSessionView {
             slash_commands_source,
             conversation_selection,
             ai_controller,
+            action_model,
             active_session,
             current_repo_path: None,
             git_repo_status: None,
@@ -557,6 +593,7 @@ impl TuiTerminalSessionView {
         if matches!(
             event,
             BlocklistAIHistoryEvent::AppendedExchange { .. }
+                | BlocklistAIHistoryEvent::UpdatedStreamingExchange { .. }
                 | BlocklistAIHistoryEvent::UpdatedConversationStatus { .. }
         ) {
             ctx.notify();
@@ -1051,6 +1088,94 @@ impl TuiTerminalSessionView {
             }
             self.input_view.update(ctx, |input, ctx| input.clear(ctx));
             record_static_slash_command_accepted(command.name, true, ctx);
+        } else if command.name == slash_commands::CREATE_NEW_PROJECT.name {
+            let Some(query) = argument
+                .map(|argument| argument.trim())
+                .filter(|argument| !argument.is_empty())
+            else {
+                self.show_transient_hint(
+                    "Please describe the project you want to create after /create-new-project"
+                        .to_owned(),
+                    ctx,
+                );
+                return;
+            };
+            self.ai_controller.update(ctx, |controller, ctx| {
+                controller.send_create_new_project_request(query.to_owned(), ctx);
+            });
+            self.input_view.update(ctx, |input, ctx| input.clear(ctx));
+            record_static_slash_command_accepted(command.name, true, ctx);
+        } else if command.name == slash_commands::EXPORT_TO_CLIPBOARD.name {
+            let markdown = self
+                .conversation_selection
+                .as_ref(ctx)
+                .selected_conversation(ctx)
+                .map(|conversation| {
+                    conversation.export_to_markdown(Some(self.action_model.as_ref(ctx)))
+                });
+            let message = match export_markdown_to_clipboard(markdown, ctx.clipboard()) {
+                ClipboardExportOutcome::Exported => "Conversation exported to clipboard",
+                ClipboardExportOutcome::NoActiveConversation => "No active conversation to export",
+            };
+            self.show_transient_hint(message.to_owned(), ctx);
+            self.input_view.update(ctx, |input, ctx| input.clear(ctx));
+            record_static_slash_command_accepted(command.name, true, ctx);
+        } else if command.name == slash_commands::EXPORT_TO_FILE.name {
+            let Some(conversation) = self
+                .conversation_selection
+                .as_ref(ctx)
+                .selected_conversation(ctx)
+            else {
+                self.show_transient_hint("No active conversation to export".to_owned(), ctx);
+                return;
+            };
+            let title = conversation.title();
+            let markdown = conversation.export_to_markdown(Some(self.action_model.as_ref(ctx)));
+            let current_directory = self
+                .active_session
+                .as_ref(ctx)
+                .current_working_directory()
+                .cloned();
+            match export_conversation_markdown(
+                current_directory.as_deref(),
+                argument.map(String::as_str),
+                title.as_deref(),
+                &markdown,
+            ) {
+                Ok(export) => {
+                    let path = export.path().display();
+                    let message = if export.overwrote_existing() {
+                        format!("Conversation exported to {path} (overwrote existing file)")
+                    } else {
+                        format!("Conversation exported to {path}")
+                    };
+                    self.show_transient_hint(message, ctx);
+                }
+                Err(error) => {
+                    let message = error.user_message();
+                    let path = error.path().to_path_buf();
+                    report_error!(
+                        anyhow::Error::new(error)
+                            .context("Failed to write TUI conversation to file"),
+                        extra: { "path" => %path.display() }
+                    );
+                    self.show_transient_hint(message, ctx);
+                }
+            }
+            self.input_view.update(ctx, |input, ctx| input.clear(ctx));
+            record_static_slash_command_accepted(command.name, true, ctx);
+        } else if command.name == slash_commands::COST.name {
+            let conversation = self
+                .conversation_selection
+                .as_ref(ctx)
+                .selected_conversation(ctx);
+            if let Some(error) = conversation_cost_validation_error(conversation) {
+                self.show_transient_hint(error.to_owned(), ctx);
+            } else {
+                self.toggle_usage_display(ctx);
+            }
+            self.input_view.update(ctx, |input, ctx| input.clear(ctx));
+            record_static_slash_command_accepted(command.name, true, ctx);
         } else if slash_command_is_submitted_as_prompt(command) {
             self.input_view.update(ctx, |input, ctx| input.clear(ctx));
             let prompt = argument
@@ -1192,8 +1317,13 @@ impl TuiView for TuiTerminalSessionView {
                     .latest_exchange()
                     .and_then(|exchange| exchange.time_since_start());
                 if let Some(elapsed) = warping_elapsed {
+                    let label = if conversation.is_summarizing() {
+                        "Summarizing conversation..."
+                    } else {
+                        "Warping..."
+                    };
                     content = content.child(
-                        TuiContainer::new(render_warping_indicator(elapsed, ctx))
+                        TuiContainer::new(render_warping_indicator(label, elapsed, ctx))
                             .with_padding_top(1)
                             .finish(),
                     );
