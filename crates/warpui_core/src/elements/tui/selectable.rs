@@ -324,6 +324,7 @@ where
             | TuiEvent::LeftMouseUp { .. }
             | TuiEvent::ScrollWheel { .. }
             | TuiEvent::KeyDown { .. }
+            | TuiEvent::Paste { .. }
             | TuiEvent::MiddleMouseDown { .. }
             | TuiEvent::RightMouseDown { .. }
             | TuiEvent::MouseMoved { .. } => false,
