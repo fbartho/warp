@@ -42,6 +42,7 @@ use warpui_core::{
     AppContext, Entity, EntityId, ModelHandle, TuiView, TypedActionView, ViewContext, ViewHandle,
 };
 
+use crate::alt_screen_view::AltScreenElement;
 use crate::autoupdate::{TuiAutoupdater, TuiAutoupdaterEvent};
 use crate::clipboard::copy_to_clipboard;
 use crate::conversation_selection::TuiConversationSelection;
@@ -126,6 +127,10 @@ pub(crate) enum TuiTerminalSessionAction {
     /// Click on the footer's usage entry: flips the persisted credits⇄cost
     /// display-mode setting.
     ToggleUsageDisplay,
+    /// Raw bytes to forward to the PTY, produced by the alt-screen element
+    /// while a full-screen app is active (keystrokes encoded to escape
+    /// sequences). Delivered to the manager as a [`PtyIntent::WriteAgentInput`].
+    ForwardToPty(Vec<u8>),
 }
 
 /// The authenticated terminal/session surface rendered inside [`RootTuiView`].
@@ -156,6 +161,11 @@ pub(crate) struct TuiTerminalSessionView {
     /// Transient notice shown in the footer's hint slot (e.g. a rejected
     /// shell submission).
     transient_hint: TransientHint,
+    /// Whether focus is currently held off the input editor because an
+    /// alt-screen app is active (so its raw keystrokes reach the PTY instead of
+    /// the input keymap). Tracks the enter/exit transition so focus is only
+    /// moved once per transition, not on every wakeup.
+    alt_screen_focus_active: bool,
 }
 
 /// Registers the session surface's keybindings. Called once at TUI startup
@@ -497,11 +507,25 @@ impl TuiTerminalSessionView {
         ctx.spawn_stream_local(
             throttle(WAKEUP_THROTTLE_PERIOD, wakeups_rx),
             |view, _, ctx| {
-                {
+                let alt_screen_active = {
                     let mut model = view.terminal_model.lock();
-                    if !model.is_alt_screen_active() {
+                    let alt_screen_active = model.is_alt_screen_active();
+                    if !alt_screen_active {
                         model.block_list_mut().update_background_block_height();
                         model.block_list_mut().update_active_block_height();
+                    }
+                    alt_screen_active
+                };
+
+                // Hand keyboard focus to the alt-screen app while it's active
+                // (so keys reach the PTY rather than the hidden input editor's
+                // keymap), and restore input focus when it exits.
+                if alt_screen_active != view.alt_screen_focus_active {
+                    view.alt_screen_focus_active = alt_screen_active;
+                    if alt_screen_active {
+                        ctx.focus_self();
+                    } else {
+                        ctx.focus(&view.input_view);
                     }
                 }
 
@@ -532,6 +556,7 @@ impl TuiTerminalSessionView {
             ai_input_model,
             terminal_model: model,
             transient_hint: TransientHint::default(),
+            alt_screen_focus_active: false,
         }
     }
 
@@ -1109,6 +1134,12 @@ impl TuiView for TuiTerminalSessionView {
     }
 
     fn render(&self, ctx: &AppContext) -> Box<dyn TuiElement> {
+        // While a full-screen (alt-screen) app is active, hand the whole pane to
+        // it: render its grid and forward input, instead of the block UI.
+        if self.terminal_model.lock().is_alt_screen_active() {
+            return AltScreenElement::new(self.terminal_model.clone()).finish();
+        }
+
         let inline_menu = self.inline_menu.render(ctx);
         // The border takes the shell-mode accent while in shell mode.
         let builder = TuiUiBuilder::from_app(ctx);
@@ -1216,6 +1247,14 @@ impl TypedActionView for TuiTerminalSessionView {
         match action {
             TuiTerminalSessionAction::Interrupt => self.handle_interrupt(ctx),
             TuiTerminalSessionAction::ToggleUsageDisplay => self.toggle_usage_display(ctx),
+            TuiTerminalSessionAction::ForwardToPty(bytes) => {
+                // Raw passthrough: the bytes are already the app's escape
+                // sequence, so write them to the PTY unmodified.
+                ctx.emit(TuiTerminalSessionEvent::WriteAgentInput {
+                    bytes: Cow::Owned(bytes.clone()),
+                    mode: AIAgentPtyWriteMode::Raw,
+                });
+            }
         }
     }
 }
