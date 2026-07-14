@@ -50,7 +50,7 @@ Out of scope (explicit non-goals):
   a follow-up if requested.
 - `<picture>` used inline (mid-paragraph) rather than as its own block.
 - Copy/export round-tripping the full `<picture>`/`<source>` structure losslessly — see
-  Behavior §7 for the minimum bar.
+  Behavior §8 for the minimum bar.
 - Any change to plain `<img>` or Markdown-native `![]()` image behavior.
 
 ## Behavior
