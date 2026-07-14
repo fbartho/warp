@@ -74,9 +74,11 @@ Out of scope (explicit non-goals):
    fallback behavior (an unmatched `</u>` renders as the literal string `</u>`) — never a
    panic and never silently swallowed content.
 
-5. Copy / export of a document containing `<kbd>` preserves the tag: copying rendered
-   `<kbd>` content back out as Markdown round-trips to `<kbd>…</kbd>` source (matching how
-   `<u>` round-trips today), not silently downgraded to plain or code-span text.
+5. Copy / export preserves the tag choice: a `<kbd>`-styled run canonically re-serializes
+   back to `<kbd>…</kbd>` source (matching how an `<u>`-styled run re-serializes to `<u>`
+   today), not silently downgraded to plain or code-span text. This is style-fidelity, not
+   byte-exact source preservation — Warp does not guarantee reproducing the document's
+   original source formatting verbatim.
 
 ## Priority framing
 
