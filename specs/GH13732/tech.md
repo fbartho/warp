@@ -155,7 +155,9 @@ must round-trip through `to_plain_text` as either `<br>` or the GFM hard-break s
 (product invariant 6 leaves the exact choice to this spec: recommend emitting `<br>` for
 cell breaks, since GFM prose export has no hard-break syntax that survives a pipe-table
 cell's line-based grammar, and CommonMark hard-break syntax for standalone paragraph breaks
-since that's lossless and more idiomatic Markdown).
+since that achieves canonical re-serialization — the break survives semantically — and is
+more idiomatic Markdown; Warp does not guarantee byte-exact preservation of the original
+source here or elsewhere in the `.md` pipeline).
 
 ### 2. Tokenizer: recognize `<br>` and hard breaks
 

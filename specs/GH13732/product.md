@@ -39,7 +39,10 @@ In scope:
   unreachable syntactically — `<br>` remains the primary and only reliably-authorable
   mechanism inside a cell.
 - Degrade gracefully: an unrecognized `<br …>` variant with attributes Warp doesn't
-  understand still produces a line break (attributes are ignored, not rejected).
+  understand still produces a line break (attributes are ignored, not rejected). A tag that
+  doesn't parse as a `<br …>` shape at all — unclosed (no terminating `>`), or stray `<`
+  followed by non-tag content — falls back to literal text, deterministically, not undefined
+  or unspecified behavior.
 
 Out of scope (explicit non-goals):
 
