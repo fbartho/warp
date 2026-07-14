@@ -112,6 +112,13 @@ lines, extract the raw HTML, hand it to the DOM-based reader). Within a recogniz
   the block is malformed — return `None`/fail the block detector so the region falls back to
   literal text (product invariant 6), matching the `<table>` spec's malformed-block
   precedent.
+- The same `None`/fail-the-block-detector path handles every other malformed case
+  deterministically (product invariant 6): an unclosed `<picture>` (no matching
+  `</picture>` found before EOF or the next block boundary), a stray/malformed `<source>`
+  or `<img>` tag, or a `srcset` value that doesn't parse as a URL token. None of these are
+  left as unspecified parser behavior — all resolve to the literal-text fallback, distinct
+  from an unrecognized `media` query on an otherwise well-formed `<source>`, which is a
+  no-match (not malformed) case per invariant 3.
 - If there are zero `<source>` children but a valid `<img>`, still produce a value (product
   invariant 7) — this is just the #13721 `<img>` path with an extra wrapper element, so
   reuse whatever `<img>`-config-building the sizing spec exposes rather than re-deriving it.
@@ -212,6 +219,9 @@ are ignored).
   parse (invariant 7).
 - `<picture>` with `<source>`(s) but no fallback `<img>` → malformed, literal-text fallback
   (invariant 6).
+- Unclosed `<picture>` (missing `</picture>`), a stray/malformed `<source>`/`<img>` tag, and
+  a `srcset` that doesn't parse as a URL → all malformed, literal-text fallback (invariant 6),
+  distinct from the unrecognized-`media` no-match case above.
 - `srcset` with density descriptors (`img-1x.png 1x, img-2x.png 2x`) → first URL only taken.
 
 ### Model/resolution unit tests (`crates/editor/src/render/model/mod_tests.rs`)

@@ -82,15 +82,24 @@ Out of scope (explicit non-goals):
 
 6. A `<picture>` with `<source>` elements but no fallback `<img>` child is treated as
    malformed and renders as literal text (matching the `<img>` spec's malformed-tag
-   fallback) rather than picking one `<source>` arbitrarily or rendering nothing.
+   fallback) rather than picking one `<source>` arbitrarily or rendering nothing. The same
+   deterministic literal-text fallback applies to any other malformed `<picture>` block:
+   an unclosed `<picture>` (no matching `</picture>`), a stray/malformed `<source>` or
+   `<img>` tag within it, or a `<source>` whose `srcset` isn't parseable as a URL (as
+   opposed to merely carrying an unrecognized `media` query, which is invariant 3's
+   no-match case, not a malformed-input case). None of these states are left unspecified —
+   each has exactly one defined outcome: the whole block's raw source is rendered as literal
+   text, never a partial render, never undefined behavior.
 
 7. A `<picture>` with a fallback `<img>` but zero `<source>` elements renders exactly as
    that plain `<img>` would — this is a degenerate case, not an error.
 
 8. Copy/export of a document containing a `<picture>` block preserves at minimum the
    fallback `<img>`'s content (matching `<img>` export behavior); the tech spec defines
-   whether the full `<picture>`/`<source>` markup is preserved for perfect round-trip or
-   collapsed to the single resolved `<img>`.
+   whether the full `<picture>`/`<source>` markup survives via canonical re-serialization or
+   is collapsed to the single resolved `<img>`. Either way, this is not a byte-exact
+   round-trip of the original source — Warp does not guarantee exact source preservation
+   anywhere in the markdown pipeline.
 
 9. Loading/error states for the selected asset follow the same behavior as a plain `<img>`
    (per #13721 and the viewer's existing asset-loading conventions) — a broken `<source>`
