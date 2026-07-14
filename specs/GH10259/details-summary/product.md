@@ -1,23 +1,27 @@
 # PRODUCT.md — Markdown viewer: `<details>/<summary>` collapsible sections
 
-Issue: https://github.com/warpdotdev/warp/issues/13652
-Preceded by: `<img>` sizing spec (`specs/GH13652/`, PR #13656)
+Issue: https://github.com/warpdotdev/warp/issues/10259
 
 ## Summary
 
-Warp's Markdown viewer drops raw inline HTML, so `<details>/<summary>` collapsible
-sections — extremely common in READMEs, changelogs, and issue templates — render as
-either literal tag text or dropped content. This spec covers teaching the Markdown
-viewer to recognize a `<details>` block with an optional `<summary>`, render the summary
-as a clickable disclosure row with a caret, and show/hide the body on click.
+Warp's Markdown viewer does not implement `<details>/<summary>` collapsible sections —
+extremely common in READMEs, changelogs, and issue templates. Verified current behavior:
+`<details>` tags render as literal text, `<summary>` tags are silently stripped (their
+inner text shows as an ordinary paragraph), nested Markdown inside the block still
+renders normally, and everything is always visible — there is no toggle, click target,
+or disclosure indicator. This spec covers teaching the Markdown viewer to recognize a
+`<details>` block with an optional `<summary>`, render the summary as a clickable
+disclosure row with a caret, and show/hide the body on click.
 
-This is tier-zero tag #2 of issue #13652 (after `<img>` sizing). It is a **larger and
-more architecturally involved** change than `<img>` sizing: unlike an image (a single
-leaf block), a `<details>` owns an arbitrary run of body content, and the collapsed
-state must persist across re-layout. The tech spec documents both a pragmatic MVP that
-reuses existing hidden-line infrastructure and the constraints that MVP imposes.
+This is a **larger and more architecturally involved** change than a single-leaf-block
+tag like `<img>` sizing: unlike an image (a single leaf block), a `<details>` owns an
+arbitrary run of body content, and the collapsed state must persist across re-layout.
+The tech spec documents both a pragmatic MVP that reuses existing hidden-line
+infrastructure and the constraints that MVP imposes.
 
-Figma: none provided.
+Figma: none provided. Expected-behavior bar: the HTML-spec default disclosure triangle
+(browsers' default `::marker` rendering for `<details>`), matching how GitHub renders
+these blocks — no custom Warp-specific chrome required for the MVP.
 
 ## Goals / Non-goals
 
@@ -47,9 +51,10 @@ Out of scope (not changed by this spec):
 - Nested `<details>` inside a `<details>` body. (Called out as a known hard case in the
   tech spec; the MVP may render an inner `<details>` as literal text rather than a
   second collapsible. This is an explicit limitation, not a silent failure.)
-- Arbitrary non-Markdown HTML inside the body beyond what the other tier-zero specs
-  cover (`<img>`, and later `<table>`). Body content is parsed as ordinary Markdown
-  blocks; unsupported raw HTML inside the body degrades the same way it does elsewhere.
+- Arbitrary non-Markdown HTML inside the body beyond what other raw-HTML-in-Markdown
+  specs cover (`<img>`, and later `<table>`). Body content is parsed as ordinary
+  Markdown blocks; unsupported raw HTML inside the body degrades the same way it does
+  elsewhere.
 - Editing/authoring affordances (inserting a `<details>` via a toolbar, etc.). This is
   viewer rendering only.
 - Animated expand/collapse transitions. Show/hide is acceptable without animation for

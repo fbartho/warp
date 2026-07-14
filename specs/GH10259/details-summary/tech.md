@@ -1,8 +1,7 @@
 # TECH.md — Markdown viewer: `<details>/<summary>` collapsible sections
 
-Product spec: `specs/GH13652/details-summary/product.md`
-GitHub issue: https://github.com/warpdotdev/warp/issues/13652
-Preceding spec in the chain: `specs/GH13652/` — `<img>` sizing (PR #13656).
+Product spec: `specs/GH10259/details-summary/product.md`
+GitHub issue: https://github.com/warpdotdev/warp/issues/10259
 
 ## Context
 
@@ -24,14 +23,32 @@ pipeline does not have as a unit:
 2. **A user-toggleable collapsed/expanded state that persists across re-layout.**
 3. **A clickable disclosure affordance inside a rendered block.**
 
-Reconnaissance of the codebase found precedent for (2) and (3), but a real gap for (1):
+Reconnaissance of the codebase found precedent for (2) and (3), but a real gap for (1).
+The closest and most directly reusable precedent is the code-review diff editor's
+hidden-section mechanism, which already combines a persisted range-hide model with a
+clickable disclosure affordance — precisely the two things a `<details>` toggle needs:
 
 ### What already exists (reusable)
 
-- **Per-block toggle state keyed by anchor→offset — the mermaid precedent.** A Mermaid
-  code block renders as either a diagram or a raw-code fallback, gated on
-  `is_mermaid && (render_mermaid_diagrams || is_user_rendered)` where `is_user_rendered`
-  reads `layout_options.mermaid_render_offsets.contains(&block_start)`
+- **The primary precedent — hidden-line ranges + click-to-expand affordance.**
+  `HiddenLinesModel` (`crates/editor/src/content/hidden_lines_model.rs:20-38`) is a
+  model-level `RangeSet<LineCount>` of hidden ranges, stored as anchor pairs so they
+  survive edits; `set_hidden_lines(...)` drives re-layout. Its render counterpart,
+  `RenderableHiddenSection` (`crates/editor/src/render/element/hidden_section.rs`),
+  renders a collapsed bar ("N unmodified lines / Expand all lines") as a
+  `RenderableBlock` built from a `MouseStateHandle` + `Hoverable` with `.on_click(...)`
+  dispatching `hidden_section_clicked` (`app/src/code/editor/view/actions.rs:33-133`,
+  implemented only by the code-review `CodeEditorView`, which returns
+  `CodeEditorViewAction::HiddenSectionExpansion { line_range, expansion_type }`). Its
+  backing layout variant is `BlockItem::Hidden(HiddenBlockConfig)`
+  (`crates/editor/src/render/model/mod.rs:~1225`), emitted during layout and dispatched
+  through `hidden_section_clicked` at `crates/editor/src/render/element/mod.rs:379`.
+  This gives `<details>` a working model for both halves of the toggle: a persisted
+  hidden range or a persisted disclosure state.
+- **Per-block toggle state keyed by anchor→offset — the mermaid precedent (state
+  mechanism only).** A Mermaid code block renders as either a diagram or a raw-code
+  fallback, gated on `is_mermaid && (render_mermaid_diagrams || is_user_rendered)` where
+  `is_user_rendered` reads `layout_options.mermaid_render_offsets.contains(&block_start)`
   (`crates/editor/src/content/edit.rs:761-763`). The offset set lives on
   `RenderLayoutOptions` (`crates/editor/src/render/model/mod.rs:192-195`) with a setter
   at `:~2375`. The source of truth is a per-block child model field
@@ -42,19 +59,11 @@ Reconnaissance of the codebase found precedent for (2) and (3), but a real gap f
   `EditorViewAction::MermaidDisplayModeSelected { start_anchor, mode }`
   (`app/src/notebooks/editor/notebook_command.rs:685-715`) →
   `view.rs:3064` resolves the anchor → `model.set_mermaid_render_mode(offset, mode)`
-  (`model.rs:380`) → `sync_*` → `rebuild_layout`.
-- **An in-editor collapse-with-caret affordance — the hidden-section precedent.**
-  `crates/editor/src/render/element/hidden_section.rs` renders a collapsed bar
-  ("N unmodified lines / Expand all lines") as a `RenderableBlock` built from a
-  `MouseStateHandle` + `Hoverable` with `.on_click(...)` dispatching
-  `hidden_section_clicked` (`app/src/code/editor/view/actions.rs:~1314`). Its backing
-  variant is `BlockItem::Hidden(HiddenBlockConfig)`
-  (`crates/editor/src/render/model/mod.rs:~1225`), emitted during layout at
-  `edit.rs:~980` and `:~1173`. The "what is hidden" state is a model-level
-  `RangeSet<LineCount>` in `HiddenLinesModel`
-  (`crates/editor/src/content/hidden_lines_model.rs`), and `set_hidden_lines(...)` drives
-  re-layout. This is the closest precedent for "hide a range of lines behind a
-  clickable affordance."
+  (`model.rs:380`) → `sync_*` → `rebuild_layout`. Note: `crates/editor/src/content/mermaid_diagram.rs`
+  is unrelated to this toggle — it is pure static-SVG asset plumbing (fetches/caches a
+  rendered Mermaid diagram via `AssetCache`) and has no toggle logic of its own; the
+  anchor→offset toggle state lives in `edit.rs` / `model.rs` / `notebook_command.rs` as
+  cited above, not in `mermaid_diagram.rs`.
 - **Chevron icons** (`Icon::ChevronDown` / `Icon::ChevronRight`) used throughout for
   disclosure carets.
 
@@ -79,12 +88,19 @@ Relevant code:
 - `crates/markdown_parser/src/markdown_parser.rs:1626-1646` — the existing `<u>`/`</u>`
   inline-HTML tag recognition (nearest precedent for tag matching).
 - `crates/markdown_parser/src/lib.rs:155-168` — `FormattedTextLine` variants.
+- `crates/editor/src/content/hidden_lines_model.rs:20-38` — `HiddenLinesModel`
+  hide-range model (primary reuse target).
+- `crates/editor/src/render/element/hidden_section.rs` — `RenderableHiddenSection`
+  caret/click affordance (primary reuse target).
+- `app/src/code/editor/view/actions.rs:33-133` — `hidden_section_clicked` impl
+  (code-review `CodeEditorView`), returning `HiddenSectionExpansion`.
+- `crates/editor/src/render/element/mod.rs:379` — `hidden_section_clicked` dispatch
+  point in the shared `EditorViewAction` trait.
 - `crates/editor/src/content/edit.rs:747-840` — mermaid two-state layout branch (toggle
-  precedent) and `BlockItem::Hidden` emission at `:~980`, `:~1173`.
-- `crates/editor/src/content/hidden_lines_model.rs` — hide-range model.
+  *state persistence* precedent, not `mermaid_diagram.rs`) and `BlockItem::Hidden`
+  emission at `:~980`, `:~1173`.
 - `crates/editor/src/render/model/mod.rs:192-195` — `RenderLayoutOptions`; `:~1172-1226`
   `BlockItem`; `:~2375` mermaid offset setter.
-- `crates/editor/src/render/element/hidden_section.rs` — caret/click affordance.
 - `app/src/notebooks/editor/model.rs:380,397,417` — mermaid state sync + `rebuild_layout`.
 - `app/src/notebooks/editor/view.rs:3064` — anchor→offset action handler.
 - `app/src/notebooks/editor/notebook_command.rs:618,685-715` — footer toggle affordance.
@@ -94,12 +110,16 @@ Relevant code:
 **Option A — hidden-range MVP (recommended for the first PR).** Parse `<details>` into a
 pair of marker blocks (a summary/disclosure block and an end marker) plus the body left as
 ordinary top-level blocks. When collapsed, add the body's line range to a per-section
-hide set (reusing `HiddenLinesModel`-style range suppression) so the body blocks are not
-laid out. The disclosure block renders the caret + summary and toggles the hide range on
-click, mirroring the mermaid anchor→offset→`rebuild_layout` chain.
+hide set, directly reusing the code-review diff editor's `HiddenLinesModel` /
+`BlockItem::Hidden` / `RenderableHiddenSection` mechanism described above so the body
+blocks are not laid out. The disclosure block renders the caret + summary and toggles the
+hide range on click, mirroring `RenderableHiddenSection`'s `Hoverable` + `on_click` →
+action-dispatch pattern for the click affordance, and the mermaid anchor→offset model for
+persisting *which* sections are currently collapsed/expanded across re-layout.
 
-- Pros: reuses two mature mechanisms (hidden-line ranges + mermaid-style toggle state),
-  no new nested-container architecture, body blocks render exactly as top-level ones.
+- Pros: reuses two mature mechanisms (hidden-line ranges + click-to-expand affordance from
+  the code-review editor, anchor-keyed toggle-state persistence from mermaid), no new
+  nested-container architecture, body blocks render exactly as top-level ones.
 - Cons: the body must be parseable as ordinary top-level Markdown; **nested `<details>`
   and arbitrary raw HTML in the body are not supported** (product invariant 12). The
   summary and body are sibling top-level blocks tied together by a section id, not a true
@@ -112,7 +132,7 @@ child blocks. This is the "correct" model but is net-new architecture across the
 pipeline (parse, buffer, layout, render, selection, serialization) and is a much larger
 change — likely its own multi-PR effort.
 
-**Recommendation:** ship Option A as the tier-zero `<details>` PR, explicitly bounding
+**Recommendation:** ship Option A as the first `<details>` PR, explicitly bounding
 nested/raw-HTML-body cases as limitations, and leave Option B as a documented follow-up if
 maintainers want full nesting. The rest of this spec describes Option A. **This choice is
 called out for maintainer review** — if the team prefers the nested-container model up
@@ -265,7 +285,7 @@ exercisable there.
 
 ## Risks and follow-ups
 
-- **This is the architecturally heaviest tier-zero tag.** The honest feasibility signal:
+- **This is an architecturally heavy raw-HTML tag to support.** The honest feasibility signal:
   per-block toggle state and the caret affordance have clean precedents (mermaid,
   hidden-section), but **there is no existing block that owns child blocks**, so the MVP
   deliberately models the body as sibling top-level blocks gated by a hidden range rather
