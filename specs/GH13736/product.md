@@ -4,6 +4,12 @@ Issue: https://github.com/warpdotdev/warp/issues/13736
 Blocked by: `<img>` sizing support, https://github.com/warpdotdev/warp/issues/13721
 (fallback `<img>` rendering must land first — this spec's fallback path builds on it).
 
+**Dependency status:** #13721 is itself still an unmerged spec draft (PR #13656) as of this
+writing. The fallback and sizing sections of this spec will need to rebase to whatever
+#13721 actually lands with. The novel parts of this spec — `<source>`/media parsing, the
+theme candidate-list model, and theme resolution/live-swap — do not depend on #13721's
+specific design decisions and are reviewable independently of that rebase risk.
+
 ## Summary
 
 READMEs commonly use `<picture>` with two `<source media="(prefers-color-scheme: …)">`
