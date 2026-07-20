@@ -9,7 +9,7 @@ use nom::bytes::complete::{
 use nom::character::complete::{char, one_of, satisfy, space0, space1};
 use nom::character::is_digit;
 use nom::combinator::{
-    all_consuming, consumed, eof, fail, flat_map, map, map_parser, opt, recognize, value, verify,
+    all_consuming, consumed, eof, fail, flat_map, map, map_parser, recognize, value, verify,
 };
 use nom::error::{ContextError, ErrorKind, ParseError, context, make_error};
 use nom::multi::{fold_many_m_n, fold_many1, many_m_n, many0};
@@ -260,6 +260,10 @@ fn parse_html_comment<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
 
 /// Parse an HTML comment that occupies whole lines, consuming its trailing line ending so that it
 /// leaves no blank line behind.
+///
+/// A line ending or end-of-input is required after the trailing spaces so that a comment followed
+/// by other content on the same line (e.g. `<!-- hidden --> # Heading`) is rejected here and falls
+/// through to inline parsing instead of being treated as a whole-line block comment.
 fn parse_html_comment_block<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     markdown: &'a str,
 ) -> IResult<&'a str, &'a str, E> {
@@ -267,7 +271,7 @@ fn parse_html_comment_block<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
         "html_comment_block",
         terminated(
             preceded(space0, parse_html_comment),
-            pair(space0, opt(parse_line_ending)),
+            pair(space0, alt((parse_line_ending, eof))),
         ),
     )(markdown)
 }

@@ -2987,3 +2987,42 @@ fn test_parse_html_comment_inside_code_span_is_preserved() {
         ])]
     );
 }
+
+#[test]
+fn test_parse_html_comment_with_trailing_content_falls_through_to_inline() {
+    // A comment followed by non-whitespace on the same line is not a whole-line block comment;
+    // the trailing content (including any leading marker like `#`) must be parsed as inline text
+    // on the same line, not reparsed as a new block (e.g. a heading).
+    let source = "<!-- hidden --> # Heading\n";
+    assert_eq!(
+        test_parse_markdown(source),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text(" # Heading")
+        ])]
+    );
+}
+
+#[test]
+fn test_parse_html_comment_block_with_trailing_spaces_before_newline() {
+    // Trailing whitespace-only content after the comment still counts as a whole-line comment.
+    let source = "<!-- hidden -->   \nBody text\n";
+    assert_eq!(
+        test_parse_markdown(source),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text("Body text")
+        ])]
+    );
+}
+
+#[test]
+fn test_parse_html_comment_block_at_eof_without_trailing_newline() {
+    // A block comment at end-of-input with no trailing newline must still be recognized as a
+    // whole-line comment, not require a line ending to be present.
+    let source = "Intro\n<!-- trailing, no newline -->";
+    assert_eq!(
+        test_parse_markdown(source),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text("Intro")
+        ])]
+    );
+}
