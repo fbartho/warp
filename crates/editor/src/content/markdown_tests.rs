@@ -580,13 +580,14 @@ fn test_kbd_serialization_preserves_authored_text_not_glyph() {
     });
 }
 
-/// Nested `<kbd>` flat-collapses in the parser (issue #13733), so it serializes to the CANONICAL
-/// FLAT form `<kbd>Ctrl+N</kbd>` — a single keycap over the inner content — rather than round-
-/// tripping the authored nested `<kbd><kbd>…</kbd></kbd>` markup. The nesting is discarded at parse
-/// time (the buffer model has no depth), so flat is the only faithful serialization; preserving the
-/// authored nesting is the depth-aware work deferred to issue #13912.
+/// Depth-aware nested `<kbd>` (issue #13912): a compound `<kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd>`
+/// parses to per-key keycaps with the `+` plain and the outer `<kbd>` grouping-only, so it
+/// serializes to the CANONICAL per-key form `<kbd>Ctrl</kbd>+<kbd>N</kbd>` (the outer grouping tag
+/// is dropped — MDN explicitly sanctions omitting it). The buffer model carries a flat `kbd` style
+/// per run, so the grouping outer `<kbd>` is not reconstructed; this canonical (not byte-exact)
+/// round-trip is faithful because it re-imports to the same styled runs.
 #[test]
-fn test_nested_kbd_serializes_to_flat_form() {
+fn test_nested_kbd_serializes_to_per_key_form() {
     App::test((), |mut app| async move {
         let markdown = "Press <kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd> now\n";
         let (buffer, _selection) = Buffer::mock_from_markdown(
@@ -598,13 +599,43 @@ fn test_nested_kbd_serializes_to_flat_form() {
 
         let exported = app.read_model(&buffer, |buffer, _| buffer.markdown_unescaped());
         assert!(
-            exported.contains("<kbd>Ctrl+N</kbd>"),
-            "nested kbd should serialize to the flat form, was: {exported}"
+            exported.contains("<kbd>Ctrl</kbd>+<kbd>N</kbd>"),
+            "nested kbd should serialize to the per-key form, was: {exported}"
         );
-        // The flattened form must not re-emit the nested inner tags.
+        // The grouping outer tag is not reconstructed, so no doubled tags are emitted.
         assert!(
             !exported.contains("<kbd><kbd>") && !exported.contains("</kbd></kbd>"),
             "serialization must not reproduce nested kbd tags, was: {exported}"
+        );
+    });
+}
+
+/// The per-key serialization of a compound `<kbd>` shortcut is a STABLE canonical round-trip
+/// (issue #13912): exporting the parsed buffer and re-importing the result yields byte-identical
+/// markdown. The grouping outer tag is dropped once (nested → per-key), and re-importing the
+/// per-key form is a fixpoint — it does not drift further.
+#[test]
+fn test_nested_kbd_serialization_is_stable_round_trip() {
+    App::test((), |mut app| async move {
+        let markdown = "Press <kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd> now\n";
+        let (buffer, _selection) = Buffer::mock_from_markdown(
+            markdown,
+            None,
+            Box::new(|_, _| IndentBehavior::Ignore),
+            &mut app,
+        );
+        let exported = app.read_model(&buffer, |buffer, _| buffer.markdown_unescaped());
+
+        let (reparsed_buffer, _selection) = Buffer::mock_from_markdown(
+            &exported,
+            None,
+            Box::new(|_, _| IndentBehavior::Ignore),
+            &mut app,
+        );
+        let re_exported = app.read_model(&reparsed_buffer, |buffer, _| buffer.markdown_unescaped());
+        assert_eq!(
+            exported, re_exported,
+            "per-key kbd serialization must be a stable fixpoint under re-import"
         );
     });
 }
