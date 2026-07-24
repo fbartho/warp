@@ -1021,16 +1021,15 @@ fn parse_inline<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
                 count,
                 matched,
             } => {
-                // Flat-collapse nested `<kbd>` (issue #13733): once we're inside a `<kbd>`, a
-                // further `<kbd>` open is dropped entirely (no delimiter, no literal text) and only
-                // deepens the nesting counter. The matching inner `</kbd>` is dropped in the
-                // `KbdEnd` arm below, so the whole span renders as a single flat keycap. Depth-aware
-                // per-key badging is deferred to issue #13912.
+                // Depth-aware nested `<kbd>` (issue #13912): every `<kbd>` open pushes a real
+                // delimiter (unlike the earlier flat-collapse, which dropped inner opens). Opening a
+                // `<kbd>` inside another marks the enclosing one as *grouping* (it will contribute no
+                // keycap on close); the newly opened one starts out a *leaf*. See `kbd_open_stack`.
                 if kind == DelimiterKind::KbdStart {
-                    state.kbd_depth += 1;
-                    if state.kbd_depth > 1 {
-                        continue;
+                    if let Some(enclosing_is_grouping) = state.kbd_open_stack.last_mut() {
+                        *enclosing_is_grouping = true;
                     }
+                    state.kbd_open_stack.push(false);
                 }
 
                 let node_index = state.nodes.len();
@@ -1058,16 +1057,13 @@ fn parse_inline<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
                 input = parse_underline(&mut state, remaining);
             }
             InlineToken::KbdEnd(matched) => {
-                // Mirror the open-side flat-collapse (issue #13733): an inner `</kbd>` closing a
-                // dropped inner `<kbd>` is itself dropped, leaving only the outermost pair to form
-                // the keycap. A `</kbd>` with no open (`kbd_depth == 0`) still falls through to
-                // `parse_kbd`, which emits it as literal text using the authored casing.
-                if state.kbd_depth > 1 {
-                    state.kbd_depth -= 1;
-                } else {
-                    state.kbd_depth = 0;
-                    input = parse_kbd(&mut state, matched, remaining);
-                }
+                // Depth-aware close (issue #13912): pop the matching open's leaf/grouping marker and
+                // let `parse_kbd` apply a keycap only for a leaf `<kbd>`. A grouping `<kbd>` closes
+                // without styling — its inner leaves already keycapped themselves. A `</kbd>` with no
+                // matching open (`kbd_open_stack` empty) still calls `parse_kbd`, which emits it as
+                // literal text using the authored casing.
+                let is_leaf = state.kbd_open_stack.pop().map(|grouping| !grouping);
+                input = parse_kbd(&mut state, matched, is_leaf, remaining);
             }
         }
     }
@@ -1091,10 +1087,16 @@ struct InlineState {
     /// The stack of not-yet used formatting delimiters.
     /// See https://spec.commonmark.org/0.30/#delimiter-stack.
     delimiters: Vec<Delimiter>,
-    /// Open-`<kbd>` nesting depth, used to flat-collapse nested `<kbd>` (issue #13733). Only the
-    /// outermost `<kbd>`…`</kbd>` pair produces a keycap; inner tags are dropped so the whole span
-    /// renders as one flat badge. Depth-aware per-key badging is deferred to issue #13912.
-    kbd_depth: usize,
+    /// Currently-open `<kbd>` elements, innermost last. Each entry records whether that open
+    /// `<kbd>` has had another `<kbd>` opened inside it: `true` marks it as a *grouping* element,
+    /// `false` marks it as a *leaf*.
+    ///
+    /// Depth-aware nested `<kbd>` (issue #13912): only a leaf `<kbd>` (one that directly contains
+    /// no further `<kbd>`) renders a keycap; a grouping `<kbd>` contributes no keycap of its own —
+    /// it just groups the inner leaves, and any text sitting directly inside it (e.g. the `+` in
+    /// `<kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd>`) stays plain. This matches MDN/GitHub compound
+    /// keyboard-shortcut rendering.
+    kbd_open_stack: Vec<bool>,
 }
 
 impl InlineState {
@@ -1354,10 +1356,22 @@ fn parse_underline<'a>(state: &mut InlineState, remaining: &'a str) -> &'a str {
     remaining
 }
 
-/// Parses `<kbd>`-styled text using the same logic as [`parse_underline`]. `matched` is the exact
-/// source slice of the closing tag (e.g. `</KBD>`), used verbatim when the close degrades to
-/// literal text so the authored casing is preserved.
-fn parse_kbd<'a>(state: &mut InlineState, matched: &'a str, remaining: &'a str) -> &'a str {
+/// Parses a `<kbd>` close using the same delimiter-pairing logic as [`parse_underline`]. `matched`
+/// is the exact source slice of the closing tag (e.g. `</KBD>`), used verbatim when the close
+/// degrades to literal text so the authored casing is preserved.
+///
+/// `is_leaf` carries the leaf/grouping decision for this close (issue #13912), popped from
+/// `kbd_open_stack`: `Some(true)` for a leaf `<kbd>` (renders a keycap), `Some(false)` for a
+/// grouping `<kbd>` (no keycap of its own — its inner leaves already keycapped), and `None` for a
+/// `</kbd>` with no matching open (degrades to literal text). A grouping close still resolves inner
+/// emphasis and removes its delimiter and start node; it just skips the keycap styling, leaving any
+/// inner leaf keycaps and the plain separator text (e.g. `+`) untouched.
+fn parse_kbd<'a>(
+    state: &mut InlineState,
+    matched: &'a str,
+    is_leaf: Option<bool>,
+    remaining: &'a str,
+) -> &'a str {
     let Some((kbd_start_index, kbd_start)) = state
         .delimiters
         .iter()
@@ -1371,23 +1385,23 @@ fn parse_kbd<'a>(state: &mut InlineState, matched: &'a str, remaining: &'a str) 
     };
 
     if !kbd_start.active {
-        // If the start is inactive, remove it - this prevents nested kbd elements.
+        // An inactive start can no longer pair (e.g. it was deactivated by an already-closed
+        // sibling); remove it and treat this close as literal text.
         state.delimiters.remove(kbd_start_index);
         state.push_text(matched);
         return remaining;
     }
 
     let kbd_start_node = kbd_start.node_index;
-    state.backtrack_styles(kbd_start_node, |styles| styles.kbd = true);
+    // Only a leaf `<kbd>` paints a keycap; a grouping `<kbd>` closes without styling. `is_leaf` is
+    // always `Some` on this path, since a matching open pushed a `kbd_open_stack` entry — but guard
+    // defensively rather than unwrap.
+    if is_leaf == Some(true) {
+        state.backtrack_styles(kbd_start_node, |styles| styles.kbd = true);
+    }
     process_emphasis(state, Some(kbd_start_index));
 
     state.delimiters.remove(kbd_start_index);
-    for delimiter in &mut state.delimiters[..kbd_start_index] {
-        if delimiter.kind == DelimiterKind::KbdStart {
-            delimiter.active = false;
-        }
-    }
-
     state.remove_node(kbd_start_node);
     state.last_node_closed = true;
     remaining
@@ -1890,7 +1904,12 @@ impl Delimiter {
             }
             DelimiterKind::Strikethrough => right_flanking,
             DelimiterKind::UnderlineStart => right_flanking,
-            DelimiterKind::KbdStart => right_flanking,
+            // A `<kbd>` open never closes another delimiter: a real `</kbd>` is always tokenized as
+            // `KbdEnd` and handled by `parse_kbd`, never paired here. Leaving this `right_flanking`
+            // (as the base did) let two unmatched adjacent opens like `<kbd>a<kbd>` self-pair in the
+            // terminal `process_emphasis` and spuriously keycap the text between them; `false` keeps
+            // an unpaired `<kbd>` open literal (issue #13912).
+            DelimiterKind::KbdStart => false,
         };
 
         Self {

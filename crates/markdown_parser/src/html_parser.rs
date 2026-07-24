@@ -406,6 +406,17 @@ fn parse_pending_inline_nodes(
     }
 }
 
+/// Returns whether `node` has any descendant `<kbd>` element. Used to distinguish a *leaf* `<kbd>`
+/// (which renders a keycap) from a *grouping* `<kbd>` that only wraps inner `<kbd>` elements
+/// (issue #13912). Searches the whole subtree so intervening non-`<kbd>` wrappers (e.g.
+/// `<kbd><b><kbd>…</kbd></b></kbd>`) are still detected as grouping.
+fn contains_kbd_descendant(node: &Rc<Node>) -> bool {
+    node.children.borrow().iter().any(|child| {
+        matches!(&child.data, NodeData::Element { name, .. } if &name.local == "kbd")
+            || contains_kbd_descendant(child)
+    })
+}
+
 // Parse the phrasing content: https://developer.mozilla.org/en-US/docs/Web/HTML/Content_categories#phrasing_content
 // into an inline formatted text.
 fn parse_phrasing_content(nodes: &[Rc<Node>], text_styling: Styling) -> FormattedTextInline {
@@ -445,7 +456,12 @@ fn parse_phrasing_content(nodes: &[Rc<Node>], text_styling: Styling) -> Formatte
                     "s" => decorated_styling.strikethrough = true,
                     "u" | "ins" => decorated_styling.underline = true,
                     "code" => decorated_styling.inline_code = true,
-                    "kbd" => decorated_styling.kbd = true,
+                    // Depth-aware nested `<kbd>` (issue #13912): only a *leaf* `<kbd>` (one with no
+                    // descendant `<kbd>`) renders a keycap. A grouping `<kbd>` wrapping inner
+                    // `<kbd>` elements contributes no keycap of its own, so text sitting directly
+                    // inside it (e.g. the `+` in `<kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd>`) stays
+                    // plain. Matches MDN/GitHub compound keyboard-shortcut rendering.
+                    "kbd" => decorated_styling.kbd = !contains_kbd_descendant(node),
                     // TODO: We need to add more phrasing styling we support (e.g. links) here.
                     // https://linear.app/warpdotdev/issue/CLD-335/add-html-parsing-for-headers-and-lists
                     _ => (),

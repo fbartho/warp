@@ -2060,19 +2060,22 @@ fn test_parse_bold_wrapping_kbd() {
     assert_eq!(fragments[0].styles.weight, Some(CustomWeight::Bold));
 }
 
-/// Nested `<kbd>` flat-collapses into a single keycap spanning the full inner content, rather than
-/// leaking literal `<kbd>`/`</kbd>` tags (the pre-fix behavior) or double-badging (issue #13733).
-/// Depth-aware per-key badging (outer keycap wrapping inner keycaps) is deferred to issue #13912.
+/// Depth-aware nested `<kbd>` for compound shortcuts (issue #13912): only the leaf `<kbd>` (one
+/// that directly contains no further `<kbd>`) renders a keycap; the outer `<kbd>` is grouping-only,
+/// and text sitting directly inside it but outside any inner `<kbd>` (here the `+`) stays plain.
+/// This matches MDN/GitHub rendering of `<kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd>`.
 #[test]
-fn test_parse_nested_kbd_flat_collapses() {
+fn test_parse_nested_kbd_renders_inner_keycaps() {
     let source = "<kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd>";
     let fragments = test_parse_markdown(source);
     assert_eq!(
         fragments,
-        vec![FormattedTextLine::Line(vec![FormattedTextFragment::kbd(
-            "Ctrl+N"
-        )])],
-        "nested kbd should collapse to a single flat keycap over the inner content"
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::kbd("Ctrl"),
+            FormattedTextFragment::plain_text("+"),
+            FormattedTextFragment::kbd("N"),
+        ])],
+        "each inner <kbd> is its own keycap; the outer <kbd> only groups them"
     );
 
     // Guard against regressing to the tag-leak bug: no literal tag text survives.
@@ -2086,21 +2089,51 @@ fn test_parse_nested_kbd_flat_collapses() {
     );
 }
 
-/// Deep nesting collapses deterministically to a single keycap regardless of depth (issue #13733).
+/// A lone `<kbd>` with no inner `<kbd>` is itself the leaf, so it keycaps (issue #13912). This pins
+/// that the leaf rule does not regress the common single-key case.
 #[test]
-fn test_parse_deeply_nested_kbd_flat_collapses() {
+fn test_parse_single_kbd_is_leaf_keycap() {
+    assert_eq!(
+        test_parse_markdown("<kbd>Esc</kbd>"),
+        vec![FormattedTextLine::Line(vec![FormattedTextFragment::kbd(
+            "Esc"
+        )])]
+    );
+}
+
+/// Deep nesting is grouping all the way down to the single innermost leaf (issue #13912): only the
+/// deepest `<kbd>` keycaps, every enclosing `<kbd>` is grouping-only, so the result is one keycap.
+#[test]
+fn test_parse_deeply_nested_kbd_keycaps_only_leaf() {
     let source = "<kbd><kbd><kbd><kbd><kbd>Esc</kbd></kbd></kbd></kbd></kbd>";
     assert_eq!(
         test_parse_markdown(source),
         vec![FormattedTextLine::Line(vec![FormattedTextFragment::kbd(
             "Esc"
         )])],
-        "arbitrarily deep kbd nesting should collapse to one flat keycap"
+        "arbitrarily deep kbd nesting keycaps only the innermost leaf"
+    );
+}
+
+/// A grouping `<kbd>` with several inner leaves and interleaved plain separators (issue #13912):
+/// three keycaps, two plain `+` separators, no outer keycap.
+#[test]
+fn test_parse_nested_kbd_three_keys() {
+    let source = "<kbd><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd></kbd>";
+    assert_eq!(
+        test_parse_markdown(source),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::kbd("Ctrl"),
+            FormattedTextFragment::plain_text("+"),
+            FormattedTextFragment::kbd("Shift"),
+            FormattedTextFragment::plain_text("+"),
+            FormattedTextFragment::kbd("P"),
+        ])]
     );
 }
 
 /// A stray `</kbd>` with no matching open still renders as literal text (issue #13733) — the
-/// flat-collapse depth counter must not swallow unbalanced closes.
+/// depth-aware close handling must not swallow unbalanced closes.
 #[test]
 fn test_parse_unmatched_kbd_close_is_literal() {
     let source = "no open</kbd>";
@@ -2112,37 +2145,64 @@ fn test_parse_unmatched_kbd_close_is_literal() {
     );
 }
 
-/// An unterminated OUTER `<kbd>` that still contains a balanced inner nested pair must not panic
-/// or leave a dangling delimiter — the inner pair flat-collapses (dropped) and the unmatched outer
-/// open degrades to literal text, same as any unterminated `<kbd>` (issue #13733).
+/// Malformed nesting: a well-formed inner pair inside an OUTER `<kbd>` that never closes
+/// (issue #13912). The inner leaf keycaps normally; the dangling outer open degrades to literal
+/// text in place. Deterministic and non-panicking.
 #[test]
-fn test_parse_unterminated_nested_kbd_is_literal() {
+fn test_parse_unterminated_outer_nested_kbd() {
     let source = "<kbd><kbd>Ctrl</kbd>";
     assert_eq!(
         test_parse_markdown(source),
         vec![FormattedTextLine::Line(vec![
-            FormattedTextFragment::plain_text("<kbd>Ctrl"),
-        ])]
+            FormattedTextFragment::plain_text("<kbd>"),
+            FormattedTextFragment::kbd("Ctrl"),
+        ])],
+        "the inner leaf keycaps; the unmatched outer <kbd> stays literal"
     );
 }
 
-/// Two unmatched `<kbd>` opens with no close must stay literal — never a keycap (issue #13733).
-///
-/// This pins behavior against a theorized failure raised in review: because `KbdStart` is
-/// right-flanking-closable, the final generic `process_emphasis` pass could in principle let a
-/// second `<kbd>` opener close against the first, wrapping the text between them in a keycap. It
-/// can't, because the flat-collapse depth counter (see the `KbdStart` arm in `parse_inline`) drops
-/// any second `<kbd>` opened while still nested, so two `KbdStart` delimiters never coexist on the
-/// stack for the pass to pair. The lone surviving opener degrades to literal text. Note the dropped
-/// inner `<kbd>` leaves no literal tag, so only the outer tag remains in the output.
+/// Two unmatched `<kbd>` opens with no close must stay literal — never a keycap (issue #13912).
+/// Neither open has a matching close, so no leaf pair forms and both openers degrade to literal
+/// text. Note the inner text between the two opens (`Ctrl `) is not keycapped.
 #[test]
 fn test_parse_double_open_kbd_stays_literal() {
     let source = "<kbd>Ctrl <kbd>K";
     assert_eq!(
         test_parse_markdown(source),
         vec![FormattedTextLine::Line(vec![
-            FormattedTextFragment::plain_text("<kbd>Ctrl K"),
+            FormattedTextFragment::plain_text("<kbd>Ctrl <kbd>K"),
         ])]
+    );
+}
+
+/// Two ADJACENT unmatched `<kbd>` opens with no whitespace between them must stay literal — never a
+/// keycap (issue #13912). Regression guard: because `<kbd>` open tags end in `>` and the second is
+/// preceded by a non-space char (`a`), the second open is right-flanking and would, if `<kbd>` were
+/// allowed to close, self-pair with the first in the terminal `process_emphasis` and spuriously
+/// keycap the `a`. `KbdStart` is pinned non-closing (a real `</kbd>` is a separate `KbdEnd` token),
+/// so both unmatched opens degrade to literal text.
+#[test]
+fn test_parse_adjacent_double_open_kbd_stays_literal() {
+    assert_eq!(
+        test_parse_markdown("<kbd>a<kbd>"),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text("<kbd>a<kbd>"),
+        ])]
+    );
+}
+
+/// Excessive nesting depth must remain deterministic and bounded in work, not panic or blow the
+/// stack (issue #13912). 64 nested opens around a single leaf keycap the innermost content only.
+#[test]
+fn test_parse_excessively_nested_kbd() {
+    let depth = 64;
+    let source = format!("{}Esc{}", "<kbd>".repeat(depth), "</kbd>".repeat(depth));
+    assert_eq!(
+        test_parse_markdown(&source),
+        vec![FormattedTextLine::Line(vec![FormattedTextFragment::kbd(
+            "Esc"
+        )])],
+        "deep-but-balanced nesting keycaps only the innermost leaf"
     );
 }
 

@@ -578,3 +578,30 @@ fn test_kbd_paste() {
         ])]
     );
 }
+
+/// Pasted nested `<kbd>` for a compound shortcut maps to per-key keycaps with the outer `<kbd>`
+/// grouping-only (issue #13912): only the leaf `<kbd>` elements carry the `kbd` style, and the `+`
+/// sitting directly under the outer `<kbd>` stays plain. Mirrors MDN/GitHub compound-shortcut markup.
+#[test]
+fn test_nested_kbd_paste_renders_inner_keycaps() {
+    assert_eq!(
+        test_parse_html("<kbd><kbd>Ctrl</kbd>+<kbd>N</kbd></kbd>"),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::kbd("Ctrl"),
+            FormattedTextFragment::plain_text("+"),
+            FormattedTextFragment::kbd("N"),
+        ])]
+    );
+}
+
+/// A pasted lone `<kbd>` with no inner `<kbd>` is the leaf and keycaps normally (issue #13912) —
+/// the leaf rule must not regress the single-key paste case.
+#[test]
+fn test_single_kbd_paste_is_leaf_keycap() {
+    assert_eq!(
+        test_parse_html("<kbd>Esc</kbd>"),
+        vec![FormattedTextLine::Line(vec![FormattedTextFragment::kbd(
+            "Esc"
+        )])]
+    );
+}
