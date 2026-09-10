@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use ::ai::api_keys::CustomEndpointDefinitions;
 use chrono::{DateTime, Utc};
 pub use cloud_object_models::{
     AgentModeCommandExecutionPredicate, DEFAULT_COMMAND_EXECUTION_ALLOWLIST,
@@ -25,13 +26,14 @@ use warp_core::features::FeatureFlag;
 use warp_errors::report_if_error;
 use warpui::platform::OperatingSystem;
 use warpui::platform::keyboard::KeyCode;
-use warpui::{AppContext, Entity, ModelContext, SingletonEntity, UpdateModel};
+use warpui::{AppContext, Entity, ModelContext, SingletonEntity, UpdateModel, WeakViewHandle};
 
+use crate::ai::execution_profiles::ExecutionProfilesConfig;
 use crate::ai::request_usage_model::RequestLimitInfo;
 use crate::auth::AuthStateProvider;
 use crate::settings::PrivacySettings;
-use crate::terminal::CLIAgent;
-use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::terminal::{CLIAgent, TerminalView};
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
 
 pub enum FocusedTerminalInfoEvent {
     TerminalInfoUpdated,
@@ -42,16 +44,18 @@ pub enum FocusedTerminalInfoEvent {
 /// remote sessions.
 #[derive(Default, Clone, Debug)]
 pub struct FocusedTerminalInfo {
+    terminal: Option<WeakViewHandle<TerminalView>>,
     contains_any_remote_blocks: bool,
     contains_any_restored_remote_blocks: bool,
 }
 
 impl FocusedTerminalInfo {
     pub fn new(_: &mut ModelContext<Self>) -> Self {
-        Self {
-            contains_any_remote_blocks: false,
-            contains_any_restored_remote_blocks: false,
-        }
+        Self::default()
+    }
+
+    pub fn terminal(&self) -> Option<&WeakViewHandle<TerminalView>> {
+        self.terminal.as_ref()
     }
 
     pub fn contains_any_remote_blocks(&self) -> bool {
@@ -62,27 +66,31 @@ impl FocusedTerminalInfo {
         self.contains_any_restored_remote_blocks
     }
 
-    /// Updates both remote blocks and restored blocks status in a single atomic operation.
-    /// Only emits a TerminalInfoUpdated event if either value changes.
+    /// Records what the focused `terminal` contains, in a single atomic operation.
+    /// Only emits a TerminalInfoUpdated event if anything changes.
     /// Returns true if the event was emitted.
+    ///
+    /// The surface is written together with its flags rather than tracked separately so a
+    /// reader cannot resolve one terminal's team for another terminal's content.
     pub fn update(
         &mut self,
+        terminal: WeakViewHandle<TerminalView>,
         contains_any_remote_blocks: bool,
         contains_any_restored_remote_blocks: bool,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
-        let remote_changed = self.contains_any_remote_blocks != contains_any_remote_blocks;
-        let restored_changed =
-            self.contains_any_restored_remote_blocks != contains_any_restored_remote_blocks;
-
-        if remote_changed || restored_changed {
-            self.contains_any_remote_blocks = contains_any_remote_blocks;
-            self.contains_any_restored_remote_blocks = contains_any_restored_remote_blocks;
-            ctx.emit(FocusedTerminalInfoEvent::TerminalInfoUpdated);
-            return true;
+        let unchanged = self.terminal.as_ref().map(|held| held.id()) == Some(terminal.id())
+            && self.contains_any_remote_blocks == contains_any_remote_blocks
+            && self.contains_any_restored_remote_blocks == contains_any_restored_remote_blocks;
+        if unchanged {
+            return false;
         }
 
-        false
+        self.terminal = Some(terminal);
+        self.contains_any_remote_blocks = contains_any_remote_blocks;
+        self.contains_any_restored_remote_blocks = contains_any_restored_remote_blocks;
+        ctx.emit(FocusedTerminalInfoEvent::TerminalInfoUpdated);
+        true
     }
 }
 
@@ -276,6 +284,200 @@ impl VoiceInputToggleKey {
     }
 }
 
+/// The full ISO-639-1 language catalog offered in the voice-input Speech
+/// Language picker, as `(code, display_name)` pairs. The empty code is the
+/// `Auto-detect` sentinel: when it is the stored value, no language is forced
+/// and the transcription provider (Wispr Flow) auto-detects the language.
+/// Kept as a data table (rather than an enum) so the entire list stays easy to
+/// scan and extend; the picker is filterable, so the length is not a problem.
+pub const VOICE_INPUT_LANGUAGES: &[(&str, &str)] = &[
+    ("", "Auto-detect"),
+    ("ab", "Abkhaz"),
+    ("aa", "Afar"),
+    ("af", "Afrikaans"),
+    ("ak", "Akan"),
+    ("sq", "Albanian"),
+    ("am", "Amharic"),
+    ("ar", "Arabic"),
+    ("an", "Aragonese"),
+    ("hy", "Armenian"),
+    ("as", "Assamese"),
+    ("av", "Avaric"),
+    ("ae", "Avestan"),
+    ("ay", "Aymara"),
+    ("az", "Azerbaijani"),
+    ("bm", "Bambara"),
+    ("ba", "Bashkir"),
+    ("eu", "Basque"),
+    ("be", "Belarusian"),
+    ("bn", "Bengali"),
+    ("bh", "Bihari"),
+    ("bi", "Bislama"),
+    ("bs", "Bosnian"),
+    ("br", "Breton"),
+    ("bg", "Bulgarian"),
+    ("my", "Burmese"),
+    ("ca", "Catalan"),
+    ("ch", "Chamorro"),
+    ("ce", "Chechen"),
+    ("ny", "Chichewa"),
+    ("zh", "Chinese"),
+    ("cv", "Chuvash"),
+    ("kw", "Cornish"),
+    ("co", "Corsican"),
+    ("cr", "Cree"),
+    ("hr", "Croatian"),
+    ("cs", "Czech"),
+    ("da", "Danish"),
+    ("dv", "Divehi"),
+    ("nl", "Dutch"),
+    ("dz", "Dzongkha"),
+    ("en", "English"),
+    ("eo", "Esperanto"),
+    ("et", "Estonian"),
+    ("ee", "Ewe"),
+    ("fo", "Faroese"),
+    ("fj", "Fijian"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("ff", "Fulah"),
+    ("gl", "Galician"),
+    ("lg", "Ganda"),
+    ("ka", "Georgian"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("gn", "Guarani"),
+    ("gu", "Gujarati"),
+    ("ht", "Haitian Creole"),
+    ("ha", "Hausa"),
+    ("he", "Hebrew"),
+    ("hz", "Herero"),
+    ("hi", "Hindi"),
+    ("ho", "Hiri Motu"),
+    ("hu", "Hungarian"),
+    ("is", "Icelandic"),
+    ("io", "Ido"),
+    ("ig", "Igbo"),
+    ("id", "Indonesian"),
+    ("ia", "Interlingua"),
+    ("ie", "Interlingue"),
+    ("iu", "Inuktitut"),
+    ("ik", "Inupiaq"),
+    ("ga", "Irish"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("jv", "Javanese"),
+    ("kl", "Kalaallisut"),
+    ("kn", "Kannada"),
+    ("kr", "Kanuri"),
+    ("ks", "Kashmiri"),
+    ("kk", "Kazakh"),
+    ("km", "Khmer"),
+    ("ki", "Kikuyu"),
+    ("rw", "Kinyarwanda"),
+    ("kv", "Komi"),
+    ("kg", "Kongo"),
+    ("ko", "Korean"),
+    ("ku", "Kurdish"),
+    ("kj", "Kwanyama"),
+    ("ky", "Kyrgyz"),
+    ("lo", "Lao"),
+    ("la", "Latin"),
+    ("lv", "Latvian"),
+    ("li", "Limburgish"),
+    ("ln", "Lingala"),
+    ("lt", "Lithuanian"),
+    ("lu", "Luba-Katanga"),
+    ("lb", "Luxembourgish"),
+    ("mk", "Macedonian"),
+    ("mg", "Malagasy"),
+    ("ms", "Malay"),
+    ("ml", "Malayalam"),
+    ("mt", "Maltese"),
+    ("gv", "Manx"),
+    ("mi", "Maori"),
+    ("mr", "Marathi"),
+    ("mh", "Marshallese"),
+    ("mn", "Mongolian"),
+    ("na", "Nauru"),
+    ("nv", "Navajo"),
+    ("ng", "Ndonga"),
+    ("ne", "Nepali"),
+    ("nd", "North Ndebele"),
+    ("se", "Northern Sami"),
+    ("no", "Norwegian"),
+    ("nb", "Norwegian Bokmal"),
+    ("nn", "Norwegian Nynorsk"),
+    ("ii", "Nuosu"),
+    ("oc", "Occitan"),
+    ("oj", "Ojibwe"),
+    ("cu", "Old Church Slavonic"),
+    ("or", "Oriya"),
+    ("om", "Oromo"),
+    ("os", "Ossetian"),
+    ("pi", "Pali"),
+    ("ps", "Pashto"),
+    ("fa", "Persian"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("pa", "Punjabi"),
+    ("qu", "Quechua"),
+    ("ro", "Romanian"),
+    ("rm", "Romansh"),
+    ("rn", "Rundi"),
+    ("ru", "Russian"),
+    ("sm", "Samoan"),
+    ("sg", "Sango"),
+    ("sa", "Sanskrit"),
+    ("sc", "Sardinian"),
+    ("gd", "Scottish Gaelic"),
+    ("sr", "Serbian"),
+    ("sn", "Shona"),
+    ("sd", "Sindhi"),
+    ("si", "Sinhala"),
+    ("sk", "Slovak"),
+    ("sl", "Slovenian"),
+    ("so", "Somali"),
+    ("nr", "South Ndebele"),
+    ("st", "Southern Sotho"),
+    ("es", "Spanish"),
+    ("su", "Sundanese"),
+    ("sw", "Swahili"),
+    ("ss", "Swati"),
+    ("sv", "Swedish"),
+    ("tl", "Tagalog"),
+    ("ty", "Tahitian"),
+    ("tg", "Tajik"),
+    ("ta", "Tamil"),
+    ("tt", "Tatar"),
+    ("te", "Telugu"),
+    ("th", "Thai"),
+    ("bo", "Tibetan"),
+    ("ti", "Tigrinya"),
+    ("to", "Tongan"),
+    ("ts", "Tsonga"),
+    ("tn", "Tswana"),
+    ("tr", "Turkish"),
+    ("tk", "Turkmen"),
+    ("tw", "Twi"),
+    ("uk", "Ukrainian"),
+    ("ur", "Urdu"),
+    ("ug", "Uyghur"),
+    ("uz", "Uzbek"),
+    ("ve", "Venda"),
+    ("vi", "Vietnamese"),
+    ("vo", "Volapuk"),
+    ("wa", "Walloon"),
+    ("cy", "Welsh"),
+    ("fy", "Western Frisian"),
+    ("wo", "Wolof"),
+    ("xh", "Xhosa"),
+    ("yi", "Yiddish"),
+    ("yo", "Yoruba"),
+    ("za", "Zhuang"),
+    ("zu", "Zulu"),
+];
+
 /// The default mode for new terminal sessions.
 #[derive(
     Default,
@@ -326,7 +528,7 @@ impl DefaultSessionMode {
         match self {
             DefaultSessionMode::Terminal => "Terminal",
             DefaultSessionMode::Agent => "Agent",
-            DefaultSessionMode::CloudAgent => "Cloud Oz",
+            DefaultSessionMode::CloudAgent => "Cloud agent",
             DefaultSessionMode::TabConfig => "Tab Config",
             DefaultSessionMode::DockerSandbox => "Local Docker Sandbox",
         }
@@ -436,7 +638,7 @@ settings::macros::implement_setting_for_enum!(
     description: "Controls how child-agent messages are displayed.",
 );
 
-/// Which unit the TUI's usage entry displays.
+/// Which unit the usage entry displays in Warp Agent CLI.
 #[derive(
     Default,
     Debug,
@@ -450,7 +652,7 @@ settings::macros::implement_setting_for_enum!(
     settings_value::SettingsValue,
 )]
 #[schemars(
-    description = "Which unit the TUI's usage entry displays.",
+    description = "Which unit the usage entry displays in Warp Agent CLI.",
     rename_all = "snake_case"
 )]
 pub enum TuiUsageDisplayMode {
@@ -469,8 +671,195 @@ settings::macros::implement_setting_for_enum!(
     surface: settings::SettingSurfaces::TUI,
     private: false,
     toml_path: "agents.usage_display_mode",
-    description: "Which unit the TUI's usage entry displays: credits or provider cost.",
+    description: "Which unit the usage entry displays in Warp Agent CLI: credits or provider cost.",
 );
+
+/// Unit for GUI usage and spend displays.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Which unit the GUI's usage/spend displays show: credits or dollars.",
+    rename_all = "snake_case"
+)]
+pub enum UsageDisplayUnit {
+    #[default]
+    Credits,
+    Dollars,
+}
+
+settings::macros::implement_setting_for_enum!(
+    UsageDisplayUnit,
+    AISettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "agents.warp_agent.other.usage_display_unit",
+    description: "Which unit the GUI's usage/spend displays show: credits or dollars.",
+    feature_flag: FeatureFlag::PricingTransparency,
+);
+
+impl UsageDisplayUnit {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            UsageDisplayUnit::Credits => "Credits",
+            UsageDisplayUnit::Dollars => "Dollars",
+        }
+    }
+}
+
+/// One configurable item in the Warp Agent CLI statusline.
+#[derive(
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    Copy,
+    Clone,
+    Hash,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "A configurable item in the Warp Agent CLI statusline.",
+    rename_all = "snake_case"
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiStatuslineItem {
+    AutoApprove,
+    /// Vim mode indicator (NOR/INS/VIS/V-L/REP); hidden when vim mode is disabled.
+    VimModeIndicator,
+    Model,
+    Team,
+    WorkingDirectory,
+    GitBranch,
+    GitBranchStatus,
+    GitDiffStatus,
+    GitHubPullRequest,
+    CreditUsage,
+    ContextWindowUsage,
+    Date,
+    #[schemars(rename = "time_12_hour")]
+    Time12Hour,
+    #[schemars(rename = "time_24_hour")]
+    Time24Hour,
+    AgentTodoList,
+    VoiceInput,
+}
+
+impl TuiStatuslineItem {
+    pub const ALL: [Self; 16] = [
+        Self::AutoApprove,
+        Self::VimModeIndicator,
+        Self::Model,
+        Self::Team,
+        Self::WorkingDirectory,
+        Self::GitBranch,
+        Self::GitBranchStatus,
+        Self::GitDiffStatus,
+        Self::GitHubPullRequest,
+        Self::CreditUsage,
+        Self::ContextWindowUsage,
+        Self::Date,
+        Self::Time12Hour,
+        Self::Time24Hour,
+        Self::AgentTodoList,
+        Self::VoiceInput,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoApprove => "Auto-approve indicator",
+            Self::VimModeIndicator => "Vim mode indicator",
+            Self::Model => "Model",
+            Self::Team => "Team",
+            Self::WorkingDirectory => "Working directory",
+            Self::GitBranch => "Git branch",
+            Self::GitBranchStatus => "Git branch status",
+            Self::GitDiffStatus => "Git diff status",
+            Self::GitHubPullRequest => "GitHub pull request",
+            Self::CreditUsage => "Credit usage",
+            Self::ContextWindowUsage => "Context window usage",
+            Self::Date => "Date",
+            Self::Time12Hour => "Time (12 hour format)",
+            Self::Time24Hour => "Time (24 hour format)",
+            Self::AgentTodoList => "Agent to-do list",
+            Self::VoiceInput => "Voice input",
+        }
+    }
+}
+
+/// Ordered and enabled items in the Warp Agent CLI statusline.
+#[derive(
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+pub struct TuiStatuslineConfig {
+    pub order: Vec<TuiStatuslineItem>,
+    pub enabled: Vec<TuiStatuslineItem>,
+}
+
+impl Default for TuiStatuslineConfig {
+    fn default() -> Self {
+        Self {
+            order: TuiStatuslineItem::ALL.to_vec(),
+            enabled: vec![
+                TuiStatuslineItem::AutoApprove,
+                TuiStatuslineItem::VimModeIndicator,
+                TuiStatuslineItem::Model,
+                TuiStatuslineItem::WorkingDirectory,
+                TuiStatuslineItem::GitBranch,
+                TuiStatuslineItem::GitDiffStatus,
+            ],
+        }
+    }
+}
+
+impl TuiStatuslineConfig {
+    /// Returns a complete, duplicate-free catalog and a valid enabled subset.
+    pub fn normalized(&self) -> Self {
+        let is_legacy_config = !self.order.contains(&TuiStatuslineItem::VimModeIndicator);
+        let mut order = Vec::with_capacity(TuiStatuslineItem::ALL.len());
+        for item in self.order.iter().copied().chain(TuiStatuslineItem::ALL) {
+            if TuiStatuslineItem::ALL.contains(&item) && !order.contains(&item) {
+                order.push(item);
+            }
+        }
+
+        let mut enabled = Vec::with_capacity(self.enabled.len());
+        for item in self.enabled.iter().copied() {
+            if order.contains(&item) && !enabled.contains(&item) {
+                enabled.push(item);
+            }
+        }
+        if is_legacy_config {
+            enabled.insert(0, TuiStatuslineItem::VimModeIndicator);
+        }
+
+        Self { order, enabled }
+    }
+
+    pub fn is_enabled(&self, item: TuiStatuslineItem) -> bool {
+        self.enabled.contains(&item)
+    }
+}
 
 impl TuiUsageDisplayMode {
     /// The other unit — clicking the usage entry flips to this.
@@ -848,7 +1237,7 @@ define_settings_group!(AISettings, settings: [
     // `is_ai_autodetection_enabled()` getter.
     ai_autodetection_enabled_internal: AIAutoDetectionEnabled {
         type: bool,
-        default: true,
+        default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         surface: settings::SettingSurfaces::ALL,
@@ -1008,6 +1397,19 @@ define_settings_group!(AISettings, settings: [
     // This field is used to store the key used for voice input toggling.
     // Note this is not the named key, but rather corresponds to the physical key.
     voice_input_toggle_key: VoiceInputToggleKey,
+    // Preferred spoken language for voice transcription. Stored as an ISO-639-1
+    // code (e.g. "es"); an empty string means Auto-detect. Options come from
+    // VOICE_INPUT_LANGUAGES.
+    voice_input_language: VoiceInputLanguage {
+        type: String,
+        default: String::new(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "agents.voice.voice_input_language",
+        description: "Preferred spoken language for voice input transcription.",
+    },
     // This is not a user-visible setting - it's merely a one-time flag to track if the user has
     // explicitly interacted with voice input. We use this to determine whether we should show a toast
     // to inform the user about voice input and auto-set the keybinding.
@@ -1097,27 +1499,51 @@ define_settings_group!(AISettings, settings: [
         toml_path: "agents.profiles.agent_mode_coding_file_read_allowlist",
         description: "File paths the agent can read without asking for permission.",
     }
-    // The default model the TUI agent uses, as a file-backed setting.
-    //
-    // TUI-only (`surface: Tui`): the GUI selects its model via execution
-    // profiles, so this key only appears in (and is read from) the TUI's
-    // settings file. `"auto"` defers to Warp's automatic model selection.
-    agent_model: TuiAgentModel {
-        type: String,
-        default: "auto".to_string(),
+    // The complete execution-profile collection shared by GUI and TUI.
+    // GUI cloud synchronization respects the user's settings-sync preference;
+    // TUI settings mode keeps this value local.
+    execution_profiles: ExecutionProfiles {
+        type: ExecutionProfilesConfig,
+        default: ExecutionProfilesConfig::default(),
         supported_platforms: SupportedPlatforms::ALL,
-        sync_to_cloud: SyncToCloud::Never,
-        surface: settings::SettingSurfaces::TUI,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::ALL,
         private: false,
-        toml_path: "agents.model",
-        description: "The default model the TUI agent uses.",
+        toml_path: "agents.execution_profiles",
+        max_table_depth: 2,
+        description: "AI execution profiles and their permissions.",
+    }
+    // Non-secret custom inference endpoint definitions shared by GUI and TUI.
+    // Credentials remain in each surface's secure-storage namespace.
+    custom_endpoints: CustomEndpoints {
+        type: CustomEndpointDefinitions,
+        default: CustomEndpointDefinitions::default(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.custom_endpoints",
+        max_table_depth: 2,
+        description: "Custom inference endpoint definitions.",
     }
     // Which unit the TUI footer's usage entry displays (credits or provider
     // cost), flipped by clicking the entry.
     //
-    // TUI-only (`surface: Tui`), like `agent_model` above: modeled as a
-    // file-backed setting so the choice persists across TUI sessions.
+    // TUI-only and file-backed so the choice persists across TUI sessions.
     usage_display_mode: TuiUsageDisplayMode,
+    usage_display_unit: UsageDisplayUnit,
+    // Ordered visibility configuration for the TUI's bottom statusline.
+    // TUI-only and local so separate devices can use different terminal layouts.
+    tui_statusline: TuiStatusline {
+        type: TuiStatuslineConfig,
+        default: TuiStatuslineConfig::default(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::TUI,
+        private: false,
+        toml_path: "agents.statusline",
+        description: "Controls the order and visibility of Warp Agent CLI statusline items.",
+    },
     // Whether or not the profile-level command autoexecution speedbump has been shown.
     //
     // Not a user-visible setting - we model it as a setting so we can track how often
@@ -1388,6 +1814,20 @@ define_settings_group!(AISettings, settings: [
     }
 
     // This is not a user-visible setting - it's merely a one-time flag to track if the
+    // Warp Agent CLI launch modal has been shown to the user.
+    //
+    // We model it as a setting so it's only shown once to a given user regardless of the number of
+    // devices they use.
+    did_check_to_trigger_agent_cli_launch_modal: DidShowAgentCliLaunchModal {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::No),
+        surface: settings::SettingSurfaces::GUI,
+        private: true,
+    }
+
+    // This is not a user-visible setting - it's merely a one-time flag to track if the
     // free-AI-removal notice modal has been shown to (or silently marked as seen for) the user.
     //
     // We model it as a setting so it's only shown once to a given user regardless of the number of
@@ -1401,7 +1841,7 @@ define_settings_group!(AISettings, settings: [
         private: true,
     }
 
-    // Used to determine whether the "What's new in Oz" section of the agent view
+    // Used to determine whether the "Latest updates" section of the agent view
     // zero state is expanded or collapsed by default.
     should_expand_oz_updates: ShouldExpandOzUpdates {
         type: bool,
@@ -1412,7 +1852,7 @@ define_settings_group!(AISettings, settings: [
         private: true,
     }
 
-    // Used to determine whether the "What's new in Oz" section of the agent view
+    // Used to determine whether the "Latest updates" section of the agent view
     // zero state is shown or hidden.
     should_show_oz_updates_in_zero_state: ShouldShowOzUpdatesInZeroState {
         type: bool,
@@ -1431,7 +1871,7 @@ define_settings_group!(AISettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
-        surface: settings::SettingSurfaces::GUI,
+        surface: settings::SettingSurfaces::ALL,
         private: false,
         storage_key: "CanUseWarpCreditsWithByok",
         toml_path: "cloud_platform.third_party_api_keys.can_use_warp_credits_with_byok",
@@ -1634,6 +2074,18 @@ define_settings_group!(AISettings, settings: [
         description: "Whether agent-executed commands are included in command history.",
     }
 
+    // Whether fast forward / auto-approve can run commands that match the command denylist.
+    auto_approve_bypasses_command_denylist: AutoApproveBypassesCommandDenylist {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.warp_agent.other.auto_approve_bypasses_command_denylist",
+        description: "Whether auto-approve bypasses the command denylist.",
+    }
+
     // Controls whether the conversation history view appears in the tools panel.
     show_conversation_history: ShowConversationHistory {
         type: bool,
@@ -1685,7 +2137,7 @@ define_settings_group!(AISettings, settings: [
     }
 
     // Whether Oz should add attribution (co-author line) to commit messages and PRs.
-    // This is the user-level preference; it may be overridden by the team-level
+    // This is the user-level preference; it may be overridden by the window's team's
     // `enable_warp_attribution` AdminEnablementSetting (see
     // `UserWorkspaces::get_agent_attribution_setting`).
     agent_attribution_enabled: AgentAttributionEnabled {
@@ -1781,19 +2233,19 @@ impl AISettings {
     }
 
     pub fn is_ai_disabled_due_to_remote_session_org_policy(&self, app: &AppContext) -> bool {
-        let contains_remote_blocks = FocusedTerminalInfo::as_ref(app).contains_any_remote_blocks();
-
-        let contains_restored_remote_blocks =
-            FocusedTerminalInfo::as_ref(app).contains_any_restored_remote_blocks();
-
-        let is_ai_allowed_in_remote_sessions =
-            UserWorkspaces::as_ref(app).is_ai_allowed_in_remote_sessions();
-
-        if is_ai_allowed_in_remote_sessions {
+        let focused_terminal = FocusedTerminalInfo::as_ref(app);
+        let Some(terminal) = focused_terminal.terminal() else {
+            return false;
+        };
+        if !focused_terminal.contains_any_remote_blocks()
+            && !focused_terminal.contains_any_restored_remote_blocks()
+        {
             return false;
         }
 
-        contains_remote_blocks || contains_restored_remote_blocks
+        let user_workspaces = UserWorkspaces::as_ref(app);
+        let scope = user_workspaces.team_context(terminal, app);
+        !user_workspaces.is_ai_allowed_in_remote_sessions(&scope)
     }
 
     pub fn is_any_ai_enabled(&self, app: &AppContext) -> bool {
@@ -1805,6 +2257,22 @@ impl AISettings {
         *self.is_any_ai_enabled
             && !is_anonymous_or_logged_out
             && !self.is_ai_disabled_due_to_remote_session_org_policy(app)
+    }
+
+    /// Returns whether conversation history is available for the current
+    /// account and AI state.
+    ///
+    /// The stored `show_conversation_history` preference is kept separately so
+    /// an onboarding choice can take effect automatically after signup and AI
+    /// enablement without asking the user to toggle the setting again.
+    pub fn is_conversation_history_available(&self, app: &AppContext) -> bool {
+        self.is_any_ai_enabled(app)
+    }
+
+    /// Returns whether conversation history should currently appear in the
+    /// tools panel.
+    pub fn is_conversation_history_enabled(&self, app: &AppContext) -> bool {
+        *self.show_conversation_history && self.is_conversation_history_available(app)
     }
 
     pub fn default_session_mode(&self, app: &AppContext) -> DefaultSessionMode {
@@ -1894,6 +2362,12 @@ impl AISettings {
         cfg!(feature = "voice_input")
             && self.is_any_ai_enabled(app)
             && *self.voice_input_enabled_internal
+    }
+
+    /// Preferred spoken language for voice transcription, or `None` for auto-detect.
+    pub fn voice_input_language_code(&self) -> Option<&str> {
+        let code = self.voice_input_language.as_str();
+        if code.is_empty() { None } else { Some(code) }
     }
 
     /// Returns `true` if input autodetection is enabled.
@@ -2066,55 +2540,83 @@ impl AISettings {
         self.is_any_ai_enabled(app)
     }
 
-    pub fn is_command_allowlist_editable(&self, app: &AppContext) -> bool {
+    pub(crate) fn is_command_allowlist_editable(
+        &self,
+        scope: &impl TeamScope,
+        app: &AppContext,
+    ) -> bool {
         let set_by_workspace = UserWorkspaces::as_ref(app)
-            .ai_autonomy_settings()
+            .ai_autonomy_settings(scope)
             .has_override_for_execute_commands_allowlist();
 
         self.is_any_ai_enabled(app) && !set_by_workspace
     }
 
-    pub fn is_directory_allowlist_editable(&self, app: &AppContext) -> bool {
+    pub(crate) fn is_directory_allowlist_editable(
+        &self,
+        scope: &impl TeamScope,
+        app: &AppContext,
+    ) -> bool {
         let set_by_workspace = UserWorkspaces::as_ref(app)
-            .ai_autonomy_settings()
+            .ai_autonomy_settings(scope)
             .has_override_for_read_files_allowlist();
 
         self.is_any_ai_enabled(app) && !set_by_workspace
     }
 
-    pub fn is_execute_commands_permissions_editable(&self, app: &AppContext) -> bool {
+    pub(crate) fn is_execute_commands_permissions_editable(
+        &self,
+        scope: &impl TeamScope,
+        app: &AppContext,
+    ) -> bool {
         let set_by_workspace = UserWorkspaces::as_ref(app)
-            .ai_autonomy_settings()
+            .ai_autonomy_settings(scope)
             .has_override_for_execute_commands();
 
         self.is_any_ai_enabled(app) && !set_by_workspace
     }
 
-    pub fn is_write_to_pty_permissions_editable(&self, app: &AppContext) -> bool {
+    pub(crate) fn is_write_to_pty_permissions_editable(
+        &self,
+        scope: &impl TeamScope,
+        app: &AppContext,
+    ) -> bool {
         let set_by_workspace = UserWorkspaces::as_ref(app)
-            .ai_autonomy_settings()
+            .ai_autonomy_settings(scope)
             .has_override_for_write_to_pty();
         self.is_any_ai_enabled(app) && !set_by_workspace
     }
 
-    pub fn is_computer_use_permissions_editable(&self, app: &AppContext) -> bool {
+    pub(crate) fn is_computer_use_permissions_editable(
+        &self,
+        scope: &impl TeamScope,
+        app: &AppContext,
+    ) -> bool {
         let set_by_workspace = UserWorkspaces::as_ref(app)
-            .ai_autonomy_settings()
+            .ai_autonomy_settings(scope)
             .has_override_for_computer_use();
         self.is_any_ai_enabled(app) && !set_by_workspace
     }
 
-    pub fn is_read_files_permissions_editable(&self, app: &AppContext) -> bool {
+    pub(crate) fn is_read_files_permissions_editable(
+        &self,
+        scope: &impl TeamScope,
+        app: &AppContext,
+    ) -> bool {
         let set_by_workspace = UserWorkspaces::as_ref(app)
-            .ai_autonomy_settings()
+            .ai_autonomy_settings(scope)
             .has_override_for_read_files();
 
         self.is_any_ai_enabled(app) && !set_by_workspace
     }
 
-    pub fn is_code_diffs_permissions_editable(&self, app: &AppContext) -> bool {
+    pub(crate) fn is_code_diffs_permissions_editable(
+        &self,
+        scope: &impl TeamScope,
+        app: &AppContext,
+    ) -> bool {
         let set_by_workspace = UserWorkspaces::as_ref(app)
-            .ai_autonomy_settings()
+            .ai_autonomy_settings(scope)
             .has_override_for_code_diffs();
 
         self.is_any_ai_enabled(app) && !set_by_workspace

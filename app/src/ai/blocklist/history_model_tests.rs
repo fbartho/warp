@@ -10,8 +10,8 @@ use warpui::{App, EntityId, ModelHandle};
 
 use super::{
     AIConversationMetadata, AIQueryHistoryOutputStatus, BeginConversationRenameError,
-    BlocklistAIHistoryEvent, BlocklistAIHistoryModel, PersistedAIInput, PersistedAIInputType,
-    convert_persisted_conversation_to_ai_conversation_with_metadata,
+    BlocklistAIHistoryEvent, BlocklistAIHistoryModel, ForkConversationError, PersistedAIInput,
+    PersistedAIInputType, convert_persisted_conversation_to_ai_conversation_with_metadata,
 };
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{
@@ -33,6 +33,7 @@ use crate::ai::blocklist::controller::RequestInput;
 use crate::ai::llms::LLMId;
 use crate::auth::AuthStateProvider;
 use crate::cloud_object::{Owner, Revision, ServerMetadata, ServerPermissions};
+use crate::features::FeatureFlag;
 use crate::input_suggestions::HistoryInputSuggestion;
 use crate::persistence::ModelEvent;
 use crate::persistence::model::{
@@ -40,6 +41,7 @@ use crate::persistence::model::{
     PersistedAutoexecuteMode,
 };
 use crate::server::ids::ServerId;
+use crate::server::server_api::ServerApiProvider;
 use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
 use crate::terminal::model::session::SessionId;
 use crate::test_util::ai_agent_tasks::create_api_task;
@@ -68,6 +70,159 @@ fn create_persisted_query(
         model_id: LLMId::from("test-model"),
         coding_model_id: LLMId::from("test-coding-model"),
     }
+}
+
+#[test]
+fn ensure_remote_child_conversation_creates_one_named_run_mapping() {
+    App::test((), |mut app| async move {
+        initialize_history_persistence_for_tests(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+        let parent_run_id = "11111111-1111-1111-1111-111111111111";
+        let child_task_id: AmbientAgentTaskId =
+            "22222222-2222-2222-2222-222222222222".parse().unwrap();
+
+        let (parent_id, first, second) = history_model.update(&mut app, |history, ctx| {
+            let parent_id =
+                history.start_new_conversation(terminal_view_id, false, true, false, ctx);
+            history.assign_run_id_for_conversation(
+                parent_id,
+                parent_run_id.to_string(),
+                parent_run_id.parse().ok(),
+                terminal_view_id,
+                ctx,
+            );
+            let first = history.ensure_remote_child_conversation(
+                terminal_view_id,
+                parent_id,
+                child_task_id.to_string(),
+                child_task_id,
+                "Researcher".to_string(),
+                "Investigate observer restore".to_string(),
+                Some(Harness::Codex),
+                ctx,
+            );
+            let second = history.ensure_remote_child_conversation(
+                terminal_view_id,
+                parent_id,
+                child_task_id.to_string(),
+                child_task_id,
+                "Duplicate".to_string(),
+                String::new(),
+                Some(Harness::Oz),
+                ctx,
+            );
+            (parent_id, first, second)
+        });
+
+        assert_eq!(first, second);
+        history_model.read(&app, |history, _| {
+            assert_eq!(
+                history.conversation_id_for_agent_id(&child_task_id.to_string()),
+                Some(first),
+                "message sender attribution must resolve through the run-id index",
+            );
+            assert_eq!(history.child_conversation_ids_of(&parent_id), &[first]);
+            let child = history.conversation(&first).unwrap();
+            assert_eq!(child.agent_name(), Some("Researcher"));
+            assert_eq!(child.parent_conversation_id(), Some(parent_id));
+            assert!(child.is_remote_child());
+            assert!(!child.is_viewing_shared_session());
+            assert_eq!(child.orchestration_harness(), Some(Harness::Codex));
+        });
+    });
+}
+
+/// Reproduces the race between the SSE family drain (which materializes an
+/// `is_remote_child` placeholder for a `child_agent_started` event before the
+/// local in-process child conversation has claimed its run_id) and the local
+/// child-launch path (which calls `assign_run_id_for_conversation` once its
+/// own conversation is ready). Whichever side loses the race must not leave
+/// an orphaned duplicate behind in `children_by_parent`.
+#[test]
+fn assign_run_id_for_conversation_discards_stale_remote_placeholder_for_same_run_id() {
+    App::test((), |mut app| async move {
+        initialize_history_persistence_for_tests(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+        let parent_run_id = "11111111-1111-1111-1111-111111111111";
+        let child_task_id: AmbientAgentTaskId =
+            "22222222-2222-2222-2222-222222222222".parse().unwrap();
+
+        let (parent_id, placeholder_id, local_id) =
+            history_model.update(&mut app, |history, ctx| {
+                let parent_id =
+                    history.start_new_conversation(terminal_view_id, false, true, false, ctx);
+                history.assign_run_id_for_conversation(
+                    parent_id,
+                    parent_run_id.to_string(),
+                    parent_run_id.parse().ok(),
+                    terminal_view_id,
+                    ctx,
+                );
+
+                // SSE side wins the race first: the family drain fetches task
+                // metadata and materializes a remote-child placeholder before the
+                // local launch has finished.
+                let placeholder_id = history.ensure_remote_child_conversation(
+                    terminal_view_id,
+                    parent_id,
+                    child_task_id.to_string(),
+                    child_task_id,
+                    "Researcher".to_string(),
+                    String::new(),
+                    Some(Harness::Codex),
+                    ctx,
+                );
+
+                // Local side finishes afterwards: it already created its own real
+                // hidden-pane conversation and now claims the same run_id.
+                let local_id = history.start_new_child_conversation(
+                    terminal_view_id,
+                    "Researcher".to_string(),
+                    parent_id,
+                    Some(Harness::Codex),
+                    false,
+                    ctx,
+                );
+                history.assign_run_id_for_conversation(
+                    local_id,
+                    child_task_id.to_string(),
+                    Some(child_task_id),
+                    terminal_view_id,
+                    ctx,
+                );
+
+                (parent_id, placeholder_id, local_id)
+            });
+
+        assert_ne!(
+            placeholder_id, local_id,
+            "the placeholder and the local conversation must be distinct records for this race \
+             to be meaningful"
+        );
+        history_model.read(&app, |history, _| {
+            assert_eq!(
+                history.child_conversation_ids_of(&parent_id),
+                &[local_id],
+                "the orphaned remote placeholder must not remain alongside the real local child; \
+                 exactly one pill should represent this run_id",
+            );
+            assert_eq!(
+                history.conversation_id_for_agent_id(&child_task_id.to_string()),
+                Some(local_id),
+            );
+            assert!(
+                history.conversation(&placeholder_id).is_none(),
+                "the stale placeholder conversation should be fully discarded",
+            );
+            let child = history.conversation(&local_id).unwrap();
+            assert!(
+                !child.is_remote_child(),
+                "the surviving conversation is the real local child, not a placeholder",
+            );
+        });
+    });
 }
 
 fn create_user_query_message(
@@ -570,6 +725,7 @@ fn start_new_child_conversation_persists_harness_metadata() {
                 "Agent 1".to_string(),
                 parent_conversation_id,
                 Some(Harness::Claude),
+                false,
                 ctx,
             );
             let child_b = history_model.start_new_child_conversation(
@@ -577,6 +733,7 @@ fn start_new_child_conversation_persists_harness_metadata() {
                 "Agent 2".to_string(),
                 parent_conversation_id,
                 Some(Harness::Codex),
+                false,
                 ctx,
             );
             (
@@ -1273,7 +1430,10 @@ fn create_server_metadata(
         context_window_usage: 0.0,
         credits_spent,
         platform_credits_spent: 0.0,
+        total_provider_cost_in_cents: None,
         credits_spent_for_last_block: None,
+        charged_usage_for_last_block: None,
+        total_charged_usage: None,
         token_usage: vec![],
         tool_usage_metadata: Default::default(),
         context_window_segments: Vec::new(),
@@ -2284,6 +2444,7 @@ fn test_start_new_child_conversation_persists_child_metadata_for_restore() {
                     "Agent 1".to_string(),
                     parent_conversation_id,
                     Some(Harness::Claude),
+                    false,
                     ctx,
                 );
                 (
@@ -2557,6 +2718,7 @@ fn test_optimistic_root_restore_round_trip_yields_in_progress_optimistic_root() 
                     "Round-trip child".to_string(),
                     parent_id,
                     Some(Harness::Claude),
+                    false,
                     ctx,
                 );
                 let expected_parent_agent_id = history_model
@@ -3424,6 +3586,25 @@ fn test_set_server_conversation_token_rebinds_reverse_index() {
     });
 }
 
+#[test]
+fn test_fork_conversation_rejects_an_empty_source() {
+    App::test((), |mut app| async move {
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let source = AIConversation::new(false, false);
+
+        let error = history_model.update(&mut app, |model, ctx| {
+            model
+                .fork_conversation(&source, "[Fork] ", false, None, ctx)
+                .expect_err("forking an empty conversation should fail")
+        });
+
+        assert_eq!(
+            error.downcast_ref::<ForkConversationError>(),
+            Some(&ForkConversationError::EmptyConversation),
+        );
+    });
+}
 /// REMOTE-1519 fork-on-chip-click flow.
 /// Forking the local conversation must:
 /// 1. carry the source's server token forward as `forked_from_*` (so the
@@ -4193,6 +4374,47 @@ fn hydrate_remote_child_placeholder_with_cloud_transcript_preserves_placeholder_
             format!("{err:#}").contains("not found in conversations_by_id"),
             "error must surface the missing-placeholder reason; got: {err:#}",
         );
+    });
+}
+
+#[test]
+fn repeated_stream_completions_share_one_in_flight_metadata_fetch() {
+    let _cloud_conversations = FeatureFlag::CloudConversations.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_history_persistence_for_tests(&mut app);
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+        let terminal_surface_id = EntityId::new();
+        let conversation_id = history_model.update(&mut app, |history, ctx| {
+            let conversation_id =
+                history.start_new_conversation(terminal_surface_id, false, false, false, ctx);
+            history.set_server_conversation_token_for_conversation(
+                conversation_id,
+                "metadata-fetch-token".to_string(),
+            );
+            conversation_id
+        });
+        let stream_id = ResponseStreamId::new_for_test();
+
+        history_model.update(&mut app, |history, ctx| {
+            history.mark_response_stream_completed_successfully(
+                &stream_id,
+                conversation_id,
+                terminal_surface_id,
+                ctx,
+            );
+            history.mark_response_stream_completed_successfully(
+                &stream_id,
+                conversation_id,
+                terminal_surface_id,
+                ctx,
+            );
+            assert_eq!(
+                history.in_flight_server_metadata_fetches,
+                HashSet::from([conversation_id])
+            );
+        });
     });
 }
 

@@ -55,7 +55,10 @@ use crate::pane_group::{
     CodePane, NotebookPane, PaneGroup, PaneId, TabBarHoverIndex, TerminalPane, WorkflowPane,
 };
 use crate::safe_triangle::SafeTriangle;
-use crate::tab::{SelectedTabColor, TabData, tab_position_id};
+use crate::tab::{
+    SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, reveals_tab_shortcut_hints,
+    tab_activate_binding_name, tab_position_id,
+};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
@@ -70,6 +73,7 @@ use crate::util::color::Opacity;
 use crate::workspace::action::{NewSessionMenuAnchor, WorkspaceAction};
 use crate::workspace::cross_window_tab_drag::CrossWindowTabDrag;
 use crate::workspace::hoa_onboarding::HoaOnboardingStep;
+use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
@@ -269,10 +273,6 @@ enum TerminalPrimaryLineFont {
     Monospace,
 }
 
-fn oz_icon_fill(theme: &WarpTheme) -> WarpThemeFill {
-    theme.main_text_color(theme.background())
-}
-
 fn render_pane_icon_with_status(
     variant: IconWithStatusVariant,
     theme: &WarpTheme,
@@ -411,6 +411,7 @@ fn render_pane_row_element(
         pane_rename_editor: _,
         is_pinned,
         container_is_hovered,
+        shortcut_hint_binding_name: _,
     } = props;
     let is_selected = is_active_tab && is_focused;
     let show_pin = FeatureFlag::PinnedTabs.is_enabled() && is_pinned && !container_is_hovered;
@@ -856,6 +857,7 @@ struct PaneProps<'a> {
     /// True when the tab container containing this pane is hovered.
     /// The pin icon is hidden when a tab is hovered.
     container_is_hovered: bool,
+    shortcut_hint_binding_name: Option<&'static str>,
 }
 
 struct PaneRowState {
@@ -1054,7 +1056,7 @@ fn normalize_summary_text(text: &str) -> Option<String> {
 
 /// Returns the conversation status for a terminal pane, used to render the per-line status
 /// pill prefix in Summary mode. Mirrors the status sources used by `render_detail_status_pill`
-/// in the detail sidecar — CLI agent sessions with rich status, Oz agent conversations, or
+/// in the detail sidecar — CLI agent sessions with rich status, Warp Agent conversations, or
 /// ambient agent sessions. Returns `None` for plain terminals or conversations without status.
 fn summary_conversation_status_for_terminal(
     terminal_view: &TerminalView,
@@ -1238,6 +1240,7 @@ impl VerticalTabsPanelState {
                                 None,
                                 tab.pinned,
                                 false,
+                                None,
                                 app,
                             )
                             .is_some_and(|props| pane_matches_query(&props, &query_lower, app))
@@ -1459,17 +1462,23 @@ fn render_detail_kind_badge_icon(
             }
 
             let icon = if terminal_view.is_ambient_agent_session(app) {
-                WarpIcon::OzCloud
+                WarpIcon::CloudFilled
             } else if terminal_view
                 .selected_conversation_display_title(app)
                 .is_some()
             {
-                WarpIcon::Oz
+                // Local agent conversation: use the Warp agent logo glyph to
+                // match the icon-with-status rendering for the tab row.
+                WarpIcon::Agent
             } else {
                 WarpIcon::Terminal
             };
             let color = match icon {
-                WarpIcon::Oz | WarpIcon::OzCloud => oz_icon_fill(theme),
+                WarpIcon::CloudFilled => theme.main_text_color(theme.background()),
+                // Theme-adaptive fill: no black chip behind this glyph in the
+                // sidecar context, so use the main text color to stay visible
+                // on both dark and light themes.
+                WarpIcon::Agent => theme.main_text_color(theme.background()),
                 WarpIcon::Terminal => disabled_text,
                 _ => sub_text,
             };
@@ -1839,6 +1848,7 @@ fn render_groups(
                                     None,
                                     tab.pinned,
                                     false,
+                                    None,
                                     app,
                                 )
                                 .is_some_and(|props| {
@@ -1870,6 +1880,7 @@ fn render_groups(
                                 None,
                                 tab.pinned,
                                 false,
+                                None,
                                 app,
                             )
                             .is_some_and(|props| pane_matches_query(&props, &query_lower, app))
@@ -2229,6 +2240,7 @@ fn render_tab_group_internal(
                     None,
                     tab.pinned,
                     group_state.is_hovered(),
+                    tab_activate_binding_name(tab_index, workspace.tabs.len()),
                     app,
                 ) else {
                     return Empty::new().finish();
@@ -2288,6 +2300,7 @@ fn render_tab_group_internal(
                     is_pane_being_renamed.then_some(workspace.pane_rename_editor.clone()),
                     tab.pinned,
                     group_state.is_hovered(),
+                    tab_activate_binding_name(tab_index, workspace.tabs.len()),
                     app,
                 ) else {
                     continue;
@@ -3390,6 +3403,99 @@ fn render_title_indicator(theme: &WarpTheme) -> Box<dyn Element> {
     .finish()
 }
 
+/// Whether a row should surface the synchronized-inputs indicator. Mirrors the
+/// horizontal tab bar's `Indicator::Synced` gating in `tab.rs`: the row's tab is
+/// receiving broadcast keystrokes and tab indicators are enabled. Restricted to
+/// terminal rows because syncing only broadcasts to terminal panes.
+fn shows_synced_inputs_indicator(
+    is_terminal_row: bool,
+    are_inputs_synced: bool,
+    show_tab_indicators: bool,
+) -> bool {
+    is_terminal_row && are_inputs_synced && show_tab_indicators
+}
+
+fn row_shows_synced_inputs_indicator(props: &PaneProps<'_>, app: &AppContext) -> bool {
+    shows_synced_inputs_indicator(
+        matches!(props.typed, TypedPane::Terminal(_)),
+        SyncedInputState::as_ref(app)
+            .should_sync_this_pane_group(props.pane_group_id, props.window_id()),
+        *TabSettings::as_ref(app).show_indicators.value(),
+    )
+}
+
+/// Link icon marking a row whose tab has synchronized inputs enabled. Uses the
+/// same icon and color as the horizontal tab bar's `Indicator::Synced`.
+fn render_synced_inputs_indicator() -> Box<dyn Element> {
+    ConstrainedBox::new(
+        UiIcon::LinkHorizontal
+            .to_warpui_icon(ColorU::from_u32(TAB_INDICATOR_SYNCED_COLOR).into())
+            .finish(),
+    )
+    .with_width(BADGE_ICON_SIZE)
+    .with_height(BADGE_ICON_SIZE)
+    .finish()
+}
+
+/// Resolves the switch-to-tab shortcut label for a row while the reveal
+/// modifier is held. Returns `None` when no hint should be shown.
+fn shortcut_hint_label(props: &PaneProps<'_>, app: &AppContext) -> Option<String> {
+    if !reveals_tab_shortcut_hints(app) {
+        return None;
+    }
+    keybinding_name_to_display_string(props.shortcut_hint_binding_name?, app)
+}
+
+/// Inline label showing the switch-to-tab keyboard shortcut, mirroring the
+/// horizontal tab bar's `TabComponent::render_shortcut_hint`.
+fn render_shortcut_hint(label: &str, appearance: &Appearance) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    Text::new_inline(label.to_string(), appearance.ui_font_family(), 12.)
+        .with_color(theme.sub_text_color(theme.background()).into())
+        .finish()
+}
+
+/// Row title line with its trailing indicators — the synchronized-inputs link
+/// icon followed by the unread-activity dot — pinned to the right edge. Returns
+/// `title` untouched when the row has no indicator to show.
+fn render_row_title_line(
+    title: Box<dyn Element>,
+    shows_synced_inputs: bool,
+    shows_activity_indicator: bool,
+    shortcut_hint: Option<Box<dyn Element>>,
+    theme: &WarpTheme,
+) -> Box<dyn Element> {
+    if !shows_synced_inputs && !shows_activity_indicator && shortcut_hint.is_none() {
+        return title;
+    }
+
+    let mut indicators = Flex::row()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(4.);
+    if shows_synced_inputs {
+        indicators.add_child(render_synced_inputs_indicator());
+    }
+    if shows_activity_indicator {
+        indicators.add_child(render_title_indicator(theme));
+    }
+    if let Some(hint) = shortcut_hint {
+        indicators.add_child(hint);
+    }
+
+    Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_child(Shrinkable::new(1., title).finish())
+        .with_child(
+            Container::new(indicators.finish())
+                .with_margin_left(4.)
+                .finish(),
+        )
+        .finish()
+}
+
 fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
     let effective_subtitle = props.subtitle.clone();
     let appearance = Appearance::as_ref(app);
@@ -3447,6 +3553,13 @@ fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
         if has_indicator {
             title_row.add_child(
                 Container::new(render_title_indicator(theme))
+                    .with_margin_left(4.)
+                    .finish(),
+            );
+        }
+        if let Some(label) = shortcut_hint_label(&props, app) {
+            title_row.add_child(
+                Container::new(render_shortcut_hint(&label, appearance))
                     .with_margin_left(4.)
                     .finish(),
             );
@@ -3793,6 +3906,7 @@ impl<'a> PaneProps<'a> {
         pane_rename_editor: Option<ViewHandle<EditorView>>,
         is_pinned: bool,
         container_is_hovered: bool,
+        shortcut_hint_binding_name: Option<&'static str>,
         app: &AppContext,
     ) -> Option<Self> {
         let pane = pane_group.pane_by_id(pane_id)?;
@@ -3847,7 +3961,14 @@ impl<'a> PaneProps<'a> {
             pane_rename_editor,
             is_pinned,
             container_is_hovered,
+            shortcut_hint_binding_name,
         })
+    }
+
+    /// Window this row is rendered in. Sourced from the detail hover state,
+    /// which is always built for the window owning the vertical tabs panel.
+    fn window_id(&self) -> WindowId {
+        self.detail_hover_state.window_id
     }
 
     fn displayed_title(&self) -> &str {
@@ -4077,7 +4198,7 @@ fn terminal_kind_badge_label(is_oz_agent: bool, cli_agent: Option<CLIAgent>) -> 
     if let Some(cli_agent) = cli_agent {
         cli_agent.display_name().to_string()
     } else if is_oz_agent {
-        "Oz".to_string()
+        "Warp Agent".to_string()
     } else {
         "Terminal".to_string()
     }
@@ -4400,21 +4521,13 @@ fn render_terminal_row_content(
         }
     };
 
-    let first_line_element = if has_unread_activity(&props.typed, app) {
-        Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-            .with_child(Shrinkable::new(1., first_line).finish())
-            .with_child(
-                Container::new(render_title_indicator(theme))
-                    .with_margin_left(4.)
-                    .finish(),
-            )
-            .finish()
-    } else {
-        first_line
-    };
+    let first_line_element = render_row_title_line(
+        first_line,
+        row_shows_synced_inputs_indicator(props, app),
+        has_unread_activity(&props.typed, app),
+        shortcut_hint_label(props, app).map(|label| render_shortcut_hint(&label, appearance)),
+        theme,
+    );
 
     let mut content = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
@@ -4699,24 +4812,13 @@ fn render_summary_tab_item(
             }
         }
     }
-    let title_region = title_region.finish();
-    if summary.has_unread_activity {
-        text_col.add_child(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(Shrinkable::new(1., title_region).finish())
-                .with_child(
-                    Container::new(render_title_indicator(theme))
-                        .with_margin_left(4.)
-                        .finish(),
-                )
-                .finish(),
-        );
-    } else {
-        text_col.add_child(title_region);
-    }
+    text_col.add_child(render_row_title_line(
+        title_region.finish(),
+        row_shows_synced_inputs_indicator(&props, app),
+        summary.has_unread_activity,
+        shortcut_hint_label(&props, app).map(|label| render_shortcut_hint(&label, appearance)),
+        theme,
+    ));
 
     // Working-directory region.
     let visible_directory_count = summary
@@ -4935,20 +5037,16 @@ pub(super) fn render_summary_pane_kind_icon_circle(
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
-    // For ambient Oz / CLI agent kinds, delegate to `render_icon_with_status` so the
-    // brand-color circle is overlaid with the white cloud badge (status-less in summary
-    // mode). Non-ambient agent kinds and all other pane kinds fall through to the inline
-    // circle rendering below.
+    // Route all Warp agent kinds, plus ambient CLI agents, through
+    // `render_icon_with_status` so their circle and cloud treatment stays consistent
+    // with the pane row.
     if let Some(variant) = ambient_agent_variant(&kind) {
         return render_icon_with_status(variant, total_size, 0., theme, theme.background());
     }
     let icon_size = total_size * SUMMARY_INLINE_ICON_RATIO;
     let padding = total_size * SUMMARY_INLINE_PADDING_RATIO;
     let (icon_element, background): (Box<dyn Element>, ElementFill) = match kind {
-        SummaryPaneKind::OzAgent { .. } => (
-            WarpIcon::Oz.to_warpui_icon(oz_icon_fill(theme)).finish(),
-            theme.background().into(),
-        ),
+        SummaryPaneKind::OzAgent { .. } => unreachable!("handled by ambient_agent_variant"),
         SummaryPaneKind::CLIAgent { agent, .. } => {
             let icon_color = agent.brand_icon_color();
             let icon_element = agent
@@ -5013,14 +5111,13 @@ pub(super) fn render_summary_pane_kind_icon_circle(
     .finish()
 }
 
-/// Maps an ambient Oz / CLI agent summary-pane kind to the `IconWithStatusVariant` used to
-/// render the brand-color circle with the white cloud badge. Non-ambient kinds (and all
-/// other pane kinds) return `None` so the caller falls back to its inline rendering.
+/// Maps Warp agents and ambient CLI agents to the shared icon-with-status renderer.
+/// Non-ambient CLI agents and non-agent kinds fall back to inline summary rendering.
 fn ambient_agent_variant(kind: &SummaryPaneKind) -> Option<IconWithStatusVariant> {
     match kind {
-        SummaryPaneKind::OzAgent { is_ambient: true } => Some(IconWithStatusVariant::OzAgent {
+        SummaryPaneKind::OzAgent { is_ambient } => Some(IconWithStatusVariant::OzAgent {
             status: None,
-            is_ambient: true,
+            is_ambient: *is_ambient,
         }),
         SummaryPaneKind::CLIAgent {
             agent,
@@ -5047,7 +5144,12 @@ fn summary_pane_kind_icon(
 
     match kind {
         SummaryPaneKind::Terminal => (WarpIcon::Terminal, main_text),
-        SummaryPaneKind::OzAgent { .. } => (WarpIcon::Oz, main_text),
+        // Local agent: Agent-brand glyph with theme main-text color, consistent
+        // with the tab row and summary circle.
+        // Note: this arm is currently unreachable — OzAgent is matched by the dedicated arm in
+        // render_summary_pane_kind_icon_circle before summary_pane_kind_icon is called.
+        // Kept for completeness in case callers change.
+        SummaryPaneKind::OzAgent { .. } => (WarpIcon::Agent, main_text),
         SummaryPaneKind::CLIAgent { agent, .. } => (
             agent.icon().unwrap_or(WarpIcon::Terminal),
             WarpThemeFill::Solid(agent.brand_icon_color()),
@@ -5193,7 +5295,7 @@ fn render_terminal_primary_line_for_view(
 
 /// Primary line for terminal pane rows. Precedence:
 /// 1. CLI agent session with plugin data (query/summary) + status
-/// 2. Oz agent conversation title + status
+/// 2. Warp Agent conversation title + status
 /// 3. Terminal title
 fn render_terminal_primary_line(
     primary_line: TerminalPrimaryLineData,
@@ -6698,6 +6800,7 @@ fn detail_pane_props<'a>(
         None,
         false,
         false,
+        None,
         app,
     )
 }
@@ -7296,22 +7399,14 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
             (title, subtitle)
         };
 
-    // Title row with optional indicator
-    let title_row = if has_indicator {
-        Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(Shrinkable::new(1., title_element).finish())
-            .with_child(
-                Container::new(render_title_indicator(theme))
-                    .with_margin_left(4.)
-                    .finish(),
-            )
-            .finish()
-    } else {
-        title_element
-    };
+    // Title row with optional indicators
+    let title_row = render_row_title_line(
+        title_element,
+        row_shows_synced_inputs_indicator(&props, app),
+        has_indicator,
+        shortcut_hint_label(&props, app).map(|label| render_shortcut_hint(&label, appearance)),
+        theme,
+    );
 
     // Assemble text column: title + optional subtitle
     // Top-align the icon when there are two lines of content; center for single-line rows.

@@ -70,7 +70,7 @@ fn initialize_upload_artifact_test(
 
     profiles.update(app, |profiles, ctx| {
         if let Some(profile_id) = profiles.create_profile(ctx) {
-            profiles.set_read_files(profile_id, &ActionPermission::AlwaysAsk, ctx);
+            profiles.set_read_files(&profile_id, &ActionPermission::AlwaysAsk, ctx);
             profiles.set_active_profile(terminal_view_id, profile_id, ctx);
         }
     });
@@ -169,12 +169,14 @@ fn should_autoexecute_honors_file_read_permissions_for_resolved_path() {
         });
         let action = build_upload_artifact_action("reports/report.txt");
 
+        let team_context_resolver = UserWorkspaces::teamless_context_resolver_for_test();
         let should_autoexecute_before = executor.update(&mut app, |executor, ctx| {
             executor.should_autoexecute(
                 ExecuteActionInput {
                     action: &action,
                     conversation_id,
                 },
+                &team_context_resolver(ctx),
                 ctx,
             )
         });
@@ -193,6 +195,7 @@ fn should_autoexecute_honors_file_read_permissions_for_resolved_path() {
                     action: &action,
                     conversation_id,
                 },
+                &team_context_resolver(ctx),
                 ctx,
             )
         });

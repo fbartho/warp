@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -20,8 +20,8 @@ use crate::ActiveAgentViewsModel;
 use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
-    AIAgentActionId, AIAgentExchange, AIAgentExchangeId, AIAgentInput, AIAgentOutputStatus,
-    UserQueryMode,
+    AIAgentActionId, AIAgentExchange, AIAgentExchangeId, AIAgentInput, AIAgentOutput,
+    AIAgentOutputStatus, AgentReviewCommentBatch, UserQueryMode,
 };
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::ambient_agents::task::TaskPrincipalInfo;
@@ -32,9 +32,10 @@ use crate::ai::blocklist::agent_view::{
     ExitAgentViewError,
 };
 use crate::ai::blocklist::block::cli_controller::UserTakeOverReason;
+use crate::ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel;
 use crate::ai::blocklist::{
-    BlocklistAIHistoryEvent, BlocklistAIHistoryModel, InputConfig, InputType, ResponseStream,
-    ResponseStreamId,
+    BlocklistAIHistoryEvent, BlocklistAIHistoryModel, FakeAIBlockModel, InputConfig, InputType,
+    ResponseStream, ResponseStreamId,
 };
 use crate::ai::cloud_environments::{
     AmbientAgentEnvironment, CloudAmbientAgentEnvironment, CloudAmbientAgentEnvironmentModel,
@@ -43,6 +44,9 @@ use crate::ai::llms::LLMId;
 use crate::auth::user::TEST_USER_UID;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::cloud_object::{CloudObjectMetadata, CloudObjectPermissions};
+use crate::code_review::comments::{
+    AttachedReviewComment, AttachedReviewCommentTarget, CommentOrigin,
+};
 use crate::context_chips::prompt::Prompt;
 use crate::editor::{AutosuggestionLocation, AutosuggestionType, CrdtOperation};
 use crate::features::FeatureFlag;
@@ -51,13 +55,16 @@ use crate::pane_group::pane::PaneStack;
 use crate::pane_group::{BackingView, TerminalPaneId};
 use crate::server::ids::{ClientId, SyncId};
 use crate::server::server_api::ai::SpawnAgentRequest;
+use crate::server::team_scope::RequestTeamScope;
 use crate::settings::import::model::ImportedConfigModel;
-use crate::settings::{AISettings, AppEditorSettings, WarpPromptSeparator};
+use crate::settings::{AISettings, AppEditorSettings, RightClickBehavior, WarpPromptSeparator};
+use crate::tab::NewSessionMenuItem;
 use crate::terminal::alt_screen::should_intercept_mouse;
 use crate::terminal::block_list_element::{SnackbarPoint, SnackbarTranslationMode};
 use crate::terminal::block_list_viewport::{ClampingMode, ScrollLines};
 use crate::terminal::cli_agent_sessions::event::{
-    CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
+    CLI_AGENT_NOTIFICATION_SENTINEL, CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource,
+    CLIAgentEventType,
 };
 use crate::terminal::cli_agent_sessions::listener::CLIAgentSessionListener;
 use crate::terminal::cli_agent_sessions::{
@@ -79,13 +86,17 @@ use crate::terminal::view::load_ai_conversation::{
     RestoreConversationEntryBehavior, RestoredAIConversation,
 };
 use crate::terminal::view::shared_session::ConversationEndedTombstoneView;
-use crate::terminal::{CLIAgent, MockTerminalManager, TerminalManager, TerminalModel};
+use crate::terminal::{
+    CLIAgent, MockTerminalManager, TerminalManager, TerminalModel, should_right_click_paste,
+};
 use crate::test_util::terminal::{
     add_window_with_id_and_terminal, initialize_app_for_terminal_view,
 };
 use crate::test_util::{add_window_with_terminal, assert_eventually};
 use crate::view_components::find::FindWithinBlockState;
-use crate::workspace::ToastStack;
+use crate::workspace::view::tests::{initialize_app as initialize_workspace_app, mock_workspace};
+use crate::workspace::{ToastStack, WorkspaceAction};
+use crate::workspaces::user_workspaces::TeamlessScopeForTest;
 
 fn add_window_with_cloud_mode_terminal(app: &mut App) -> ViewHandle<TerminalView> {
     let tips_model = app.add_model(|_| Default::default());
@@ -114,6 +125,7 @@ fn owned_resumable_oz_task(task_id: AmbientAgentTaskId) -> AmbientAgentTask {
         run_time: None,
         status_message: None,
         source: None,
+        execution_location: None,
         session_id: None,
         session_link: None,
         creator: Some(TaskPrincipalInfo {
@@ -129,7 +141,24 @@ fn owned_resumable_oz_task(task_id: AmbientAgentTaskId) -> AmbientAgentTask {
         artifacts: vec![],
         last_event_sequence: None,
         children: vec![],
+        debug_agent_available: false,
+        scope: None,
     }
+}
+
+/// The AI blocks currently flagged to render the transcript-navigation ring.
+fn navigation_ring_targets(view: &TerminalView, app: &AppContext) -> Vec<EntityId> {
+    view.rich_content_views
+        .iter()
+        .filter_map(|rich_content| {
+            let ai_metadata = rich_content.ai_block_metadata()?;
+            ai_metadata
+                .ai_block_handle
+                .as_ref(app)
+                .is_agent_transcript_navigation_target()
+                .then(|| ai_metadata.ai_block_handle.id())
+        })
+        .collect()
 }
 
 fn has_pending_user_query_block(view: &TerminalView) -> bool {
@@ -188,6 +217,484 @@ fn agent_view_lifecycle_updates_input_mode() {
 }
 
 #[test]
+fn cmd_up_in_agent_view_navigates_prompts_and_user_shell_blocks() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        let (prompt_view_ids, user_shell_index) = terminal.update(&mut app, |view, ctx| {
+            let conversation_id = enter_agent_view_for_navigation(view, ctx);
+
+            // prompt 1 (user-query AI block — navigable)
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![agent_view_user_query_input("prompt 1")],
+                ctx,
+            );
+
+            // Agent-requested run-shell (unhidden) and agent-monitored command: not navigable.
+            {
+                let mut model = view.model.lock();
+                model.simulate_block("tool-call", "tool-result");
+                let tool_index = model.block_list().blocks().len() - 2;
+                let action_id = AIAgentActionId::from("tool-action".to_owned());
+                {
+                    let block = &mut model.block_list_mut().blocks_mut()[tool_index];
+                    block.set_conversation_id(conversation_id);
+                    block.set_agent_interaction_mode(
+                        crate::terminal::model::block::AgentInteractionMetadata::new_hidden(
+                            action_id.clone(),
+                            conversation_id,
+                        ),
+                    );
+                }
+                model
+                    .block_list_mut()
+                    .set_visibility_of_block_for_ai_action(&action_id, true);
+
+                model.simulate_block("agent-monitored", "output");
+                let monitored_index = model.block_list().blocks().len() - 2;
+                let block = &mut model.block_list_mut().blocks_mut()[monitored_index];
+                block.set_conversation_id(conversation_id);
+                block.set_agent_interaction_mode(
+                    crate::terminal::model::block::AgentInteractionMetadata::new(
+                        None,
+                        conversation_id,
+                        None,
+                        None,
+                        false,
+                        false,
+                    ),
+                );
+            }
+
+            // Post-tool-call agent-reply AI segment: production mounts this as a second
+            // AIBlock after run-shell. ResumeConversation has no displayable user query,
+            // so has_user_input is false and Cmd-Up must skip it.
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![AIAgentInput::ResumeConversation {
+                    context: Default::default(),
+                }],
+                ctx,
+            );
+
+            // user-executed shell command (navigable)
+            let user_shell_index =
+                simulate_user_shell_block_in_conversation(view, conversation_id, "user-shell");
+
+            // prompt 2 (user-query AI block — navigable)
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![agent_view_user_query_input("prompt 2")],
+                ctx,
+            );
+
+            // Collect AI rich-content blocks and classify via production navigable list.
+            let ai_view_ids: Vec<_> = view
+                .rich_content_views
+                .iter()
+                .filter_map(|rc| rc.ai_block_metadata().map(|meta| meta.ai_block_handle.id()))
+                .collect();
+            assert!(
+                ai_view_ids.len() >= 3,
+                "expected query + agent-reply + query AI blocks, got {}",
+                ai_view_ids.len()
+            );
+
+            let navigable = view
+                .model
+                .lock()
+                .block_list()
+                .agent_transcript_navigable_items();
+            let navigable_ai: Vec<_> = navigable
+                .iter()
+                .filter_map(|item| match item {
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id,
+                    } => Some(*view_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                navigable_ai.len(),
+                2,
+                "only user-query AI segments should be navigable, got {navigable:?}"
+            );
+            // Agent-reply segment must not appear in navigable AI stops.
+            for ai_id in &ai_view_ids {
+                if !navigable_ai.contains(ai_id) {
+                    // Non-navigable AI block present — good (the post-tool reply).
+                    continue;
+                }
+            }
+            assert!(
+                ai_view_ids.iter().any(|id| !navigable_ai.contains(id)),
+                "expected at least one non-navigable agent-reply AI block among {ai_view_ids:?}"
+            );
+
+            (navigable_ai, user_shell_index)
+        });
+
+        let prompt_1 = *prompt_view_ids.first().expect("prompt 1");
+        let prompt_2 = *prompt_view_ids.last().expect("prompt 2");
+
+        terminal.update(&mut app, |view, ctx| {
+            // From the bottom: first Cmd-Up lands on latest prompt.
+            view.select_less_recent_block(false /* is_shift_down */, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_2
+                    }
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), None);
+
+            // Next Cmd-Up lands on the user shell command.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::ShellBlock(
+                        user_shell_index
+                    )
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), Some(user_shell_index));
+
+            // Next Cmd-Up lands on the first prompt, skipping the tool call.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_1
+                    }
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), None);
+
+            // Another Cmd-Up at the oldest item stays put.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_1
+                    }
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), None);
+
+            // Cmd-Down symmetry walks back toward the latest prompt.
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::ShellBlock(
+                        user_shell_index
+                    )
+                )
+            );
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_2
+                    }
+                )
+            );
+        });
+    })
+}
+
+#[test]
+fn cmd_down_past_newest_transcript_item_scrolls_to_end() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            let conversation_id = enter_agent_view_for_navigation(view, ctx);
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![agent_view_user_query_input("prompt 1")],
+                ctx,
+            );
+            // Enough conversation blocks that the transcript is taller than the viewport.
+            for _ in 0..100 {
+                simulate_user_shell_block_in_conversation(view, conversation_id, "user-shell");
+            }
+            assert!(view.is_vertically_scrollable(ctx));
+
+            // Select the newest navigable stop, then scroll the viewport to the top.
+            view.select_less_recent_block(false /* is_shift_down */, ctx);
+            assert!(view.agent_transcript_selection_for_test().is_some());
+            view.update_scroll_position_locking(ScrollPositionUpdate::AfterHome, ctx);
+            assert!(matches!(
+                view.scroll_position(),
+                ScrollPosition::FixedAtPosition { .. }
+            ));
+
+            // Cmd-Down past the newest stop must land the viewport on the true end of
+            // the blocklist and clear the navigation selection.
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(
+                view.scroll_position(),
+                ScrollPosition::FollowsBottomOfMostRecentBlock
+            );
+            assert_eq!(view.agent_transcript_selection_for_test(), None);
+            assert_eq!(view.selected_blocks.tail(), None);
+        });
+    })
+}
+
+#[test]
+fn cmd_down_past_newest_preserves_viewport_when_already_at_end() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            let conversation_id = enter_agent_view_for_navigation(view, ctx);
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![agent_view_user_query_input("prompt 1")],
+                ctx,
+            );
+            simulate_user_shell_block_in_conversation(view, conversation_id, "user-shell");
+            assert!(!view.is_vertically_scrollable(ctx));
+
+            view.select_less_recent_block(false /* is_shift_down */, ctx);
+            assert!(view.agent_transcript_selection_for_test().is_some());
+            view.update_scroll_position_locking(ScrollPositionUpdate::AfterHome, ctx);
+            assert!(matches!(
+                view.scroll_position(),
+                ScrollPosition::FixedAtPosition { .. }
+            ));
+
+            // The whole transcript fits in the viewport, so it is already at the end:
+            // Cmd-Down past the newest stop must not touch the scroll position.
+            view.select_more_recent_block(true, false, ctx);
+            assert!(matches!(
+                view.scroll_position(),
+                ScrollPosition::FixedAtPosition { .. }
+            ));
+            assert_eq!(view.agent_transcript_selection_for_test(), None);
+        });
+    })
+}
+
+#[test]
+fn cmd_down_without_navigation_cursor_is_a_no_op() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            let conversation_id = enter_agent_view_for_navigation(view, ctx);
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![agent_view_user_query_input("prompt 1")],
+                ctx,
+            );
+            simulate_user_shell_block_in_conversation(view, conversation_id, "user-shell");
+
+            // At the end of the transcript with no navigation cursor there is nothing to
+            // move toward, so Cmd-Down must leave the cursor, the selection, the ring and
+            // the viewport untouched.
+            let scroll_position = view.scroll_position();
+            view.select_more_recent_block(
+                true,  /* is_cmd_down */
+                false, /* is_shift_down */
+                ctx,
+            );
+            assert_eq!(view.agent_transcript_selection_for_test(), None);
+            assert_eq!(view.selected_blocks.tail(), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+            assert_eq!(view.scroll_position(), scroll_position);
+
+            // Cmd-Up takes the newest stop and Cmd-Down past it clears the cursor; a
+            // further Cmd-Down must not re-select that stop (no oscillation).
+            view.select_less_recent_block(false /* is_shift_down */, ctx);
+            assert!(view.agent_transcript_selection_for_test().is_some());
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(view.agent_transcript_selection_for_test(), None);
+
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(view.agent_transcript_selection_for_test(), None);
+            assert_eq!(view.selected_blocks.tail(), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+        });
+    })
+}
+
+#[test]
+fn agent_transcript_navigation_marks_target_user_query() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        let (prompt_view_ids, user_shell_index) = terminal.update(&mut app, |view, ctx| {
+            let conversation_id = enter_agent_view_for_navigation(view, ctx);
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![agent_view_user_query_input("prompt 1")],
+                ctx,
+            );
+            let user_shell_index =
+                simulate_user_shell_block_in_conversation(view, conversation_id, "user-shell");
+            append_inputs_to_conversation_and_handle_event(
+                view,
+                conversation_id,
+                vec![agent_view_user_query_input("prompt 2")],
+                ctx,
+            );
+
+            let navigable = view
+                .model
+                .lock()
+                .block_list()
+                .agent_transcript_navigable_items();
+            let navigable_ai: Vec<_> = navigable
+                .iter()
+                .filter_map(|item| match item {
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id,
+                    } => Some(*view_id),
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::ShellBlock(_) => {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(navigable_ai.len(), 2);
+            (navigable_ai, user_shell_index)
+        });
+
+        let prompt_1 = *prompt_view_ids.first().expect("prompt 1");
+        let prompt_2 = *prompt_view_ids.last().expect("prompt 2");
+
+        terminal.update(&mut app, |view, ctx| {
+            // No navigation yet: nothing is marked.
+            assert_eq!(view.agent_transcript_navigated_ai_block(ctx), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+
+            // Every stop on a user query marks exactly that query.
+            view.select_less_recent_block(false /* is_shift_down */, ctx);
+            assert_eq!(
+                view.agent_transcript_navigated_ai_block(ctx),
+                Some(prompt_2)
+            );
+            assert_eq!(navigation_ring_targets(view, ctx), vec![prompt_2]);
+
+            // Stopping on a shell block moves the mark off the query.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(view.agent_transcript_navigated_ai_block(ctx), None);
+            assert_eq!(view.selected_blocks.tail(), Some(user_shell_index));
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+
+            // The mark follows the cursor to the other query.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_navigated_ai_block(ctx),
+                Some(prompt_1)
+            );
+            assert_eq!(navigation_ring_targets(view, ctx), vec![prompt_1]);
+
+            // Clamped at the oldest stop: the target stays identifiable even though
+            // neither the cursor nor the viewport moves.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_navigated_ai_block(ctx),
+                Some(prompt_1)
+            );
+            assert_eq!(navigation_ring_targets(view, ctx), vec![prompt_1]);
+
+            // Cmd-Down back through the stops, then past the newest one, which clears
+            // the mark together with the navigation selection.
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(view.agent_transcript_navigated_ai_block(ctx), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(
+                view.agent_transcript_navigated_ai_block(ctx),
+                Some(prompt_2)
+            );
+            assert_eq!(navigation_ring_targets(view, ctx), vec![prompt_2]);
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(view.agent_transcript_navigated_ai_block(ctx), None);
+            assert_eq!(view.agent_transcript_selection_for_test(), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+
+            // Re-mark a query, then exit the agent view below.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_navigated_ai_block(ctx),
+                Some(prompt_2)
+            );
+            assert_eq!(navigation_ring_targets(view, ctx), vec![prompt_2]);
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.agent_view_controller().update(ctx, |controller, ctx| {
+                controller.exit_agent_view_without_confirmation(ctx)
+            });
+        });
+        terminal.read(&app, |view, ctx| {
+            // Leaving the agent view drops the navigation cursor, its mark, and the ring.
+            assert_eq!(view.agent_transcript_selection_for_test(), None);
+            assert_eq!(view.agent_transcript_navigated_ai_block(ctx), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+        });
+    })
+}
+
+#[test]
+fn ordinary_block_selection_unchanged_outside_agent_view() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            {
+                let mut model = view.model.lock();
+                model.simulate_block("ls", "foo");
+                model.simulate_block("pwd", "bar");
+            }
+
+            // Outside the agent view, Cmd-Up walks ordinary block selection and never
+            // produces a query mark.
+            view.select_less_recent_block(false /* is_shift_down */, ctx);
+            let first = view.selected_blocks.tail().expect("a block gets selected");
+            assert_eq!(view.agent_transcript_navigated_ai_block(ctx), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+
+            view.select_less_recent_block(false, ctx);
+            let second = view.selected_blocks.tail().expect("a block stays selected");
+            assert_eq!(second.0 + 1, first.0);
+            assert_eq!(view.agent_transcript_navigated_ai_block(ctx), None);
+            assert!(navigation_ring_targets(view, ctx).is_empty());
+        });
+    })
+}
+
+#[test]
 fn focus_reporting_writes_focus_events_in_normal_screen() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
@@ -222,6 +729,691 @@ fn focus_reporting_writes_focus_events_in_normal_screen() {
                 escape_sequences::EscCodes::FOCUS_OUT.to_vec(),
                 escape_sequences::EscCodes::FOCUS_IN.to_vec(),
             ]
+        );
+    })
+}
+
+#[test]
+fn should_right_click_paste_true_only_without_shift_when_setting_enabled() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        SelectionSettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .right_click_behavior
+                .set_value(RightClickBehavior::Paste, ctx);
+        });
+
+        terminal.update(&mut app, |_view, ctx| {
+            assert!(
+                should_right_click_paste(false, ctx),
+                "a bare right-click should paste once the setting is enabled"
+            );
+            assert!(
+                !should_right_click_paste(true, ctx),
+                "Shift+right-click should always reveal the context menu, even with the setting enabled"
+            );
+        });
+    })
+}
+
+/// Right-clicking a long-running block that owns the mouse (SGR mouse reporting on) must forward
+/// the raw click to the PTY as a mouse report, under both `right_click_behavior` values -- it must
+/// never fall through to Paste or the block list's own context menu.
+#[test]
+fn block_list_right_click_forwards_to_pty_when_long_running_block_owns_mouse() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        let mut updated = EntityIdSet::default();
+        updated.insert(app.root_view_id(window_id).unwrap());
+        let invalidation = WindowInvalidation {
+            updated,
+            ..Default::default()
+        };
+        let presenter = Rc::new(RefCell::new(Presenter::new(window_id)));
+
+        let size_info = terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.simulate_long_running_block("cmd", "output");
+            model.set_mode(ansi::Mode::SgrMouse);
+            model.set_mode(ansi::Mode::ReportMouseClicks);
+            assert!(!model.is_alt_screen_active());
+            assert!(
+                !should_intercept_mouse(&model, false, ctx),
+                "the running command should own the mouse with SGR reporting enabled"
+            );
+            *view.size_info
+        });
+
+        macro_rules! rerender {
+            () => {
+                app.update(enclose!((presenter, invalidation) move |ctx| {
+                    presenter
+                        .borrow_mut()
+                        .invalidate(invalidation, ctx);
+                    presenter.borrow_mut().build_scene(
+                        vec2f(size_info.pane_width_px, size_info.pane_height_px),
+                        1.,
+                        None,
+                        ctx,
+                    );
+                }));
+            };
+        }
+
+        // The block list is pinned to the bottom of the pane by default, so a lone, short block
+        // sits just above the input box rather than at the top of the viewport.
+        let position = vec2f(
+            2. * size_info.cell_width_px.as_f32(),
+            size_info.pane_height_px - 3. * size_info.cell_height_px.as_f32(),
+        );
+
+        for right_click_behavior in [RightClickBehavior::ContextMenu, RightClickBehavior::Paste] {
+            SelectionSettings::handle(&app).update(&mut app, |settings, ctx| {
+                let _ = settings
+                    .right_click_behavior
+                    .set_value(right_click_behavior, ctx);
+            });
+            pty_writes.borrow_mut().clear();
+
+            rerender!();
+            app.update(enclose!((presenter) move |ctx| {
+                ctx.simulate_window_event(
+                    warpui::Event::RightMouseDown {
+                        position,
+                        cmd: false,
+                        shift: false,
+                        click_count: 1,
+                    },
+                    window_id,
+                    presenter.clone(),
+                );
+            }));
+
+            let writes = pty_writes.borrow();
+            assert_eq!(
+                writes.len(),
+                1,
+                "exactly one raw mouse report should reach the PTY under {right_click_behavior:?}, got {writes:?}"
+            );
+            assert!(
+                writes[0].starts_with(b"\x1b[<2;"),
+                "expected an SGR right-button-press mouse report under {right_click_behavior:?}, got {:?}",
+                writes[0]
+            );
+        }
+
+        // The input box must never have received a paste from either right-click.
+        let input = terminal.read(&app, |terminal, _ctx| terminal.input().clone());
+        input.read(&app, |input, ctx| {
+            assert_eq!(
+                input.buffer_text(ctx),
+                "",
+                "a long-running block's right-click must never be treated as Paste"
+            );
+        });
+    })
+}
+
+#[test]
+fn block_list_shift_right_click_opens_context_menu_when_right_click_pastes() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        let mut updated = EntityIdSet::default();
+        updated.insert(app.root_view_id(window_id).unwrap());
+        let invalidation = WindowInvalidation {
+            updated,
+            ..Default::default()
+        };
+        let presenter = Rc::new(RefCell::new(Presenter::new(window_id)));
+
+        let size_info = terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.simulate_long_running_block("cmd", "output");
+            assert!(!model.is_alt_screen_active());
+            // No mouse reporting is enabled, so Warp -- not the running command -- owns this
+            // right-click regardless of Shift.
+            assert!(should_intercept_mouse(&model, false, ctx));
+            *view.size_info
+        });
+
+        SelectionSettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .right_click_behavior
+                .set_value(RightClickBehavior::Paste, ctx);
+        });
+
+        macro_rules! rerender {
+            () => {
+                app.update(enclose!((presenter, invalidation) move |ctx| {
+                    presenter
+                        .borrow_mut()
+                        .invalidate(invalidation, ctx);
+                    presenter.borrow_mut().build_scene(
+                        vec2f(size_info.pane_width_px, size_info.pane_height_px),
+                        1.,
+                        None,
+                        ctx,
+                    );
+                }));
+            };
+        }
+
+        // Same position as the long-running block above: a lone, short block sitting just
+        // above the input box.
+        let position = vec2f(
+            2. * size_info.cell_width_px.as_f32(),
+            size_info.pane_height_px - 3. * size_info.cell_height_px.as_f32(),
+        );
+
+        let input = terminal.read(&app, |terminal, _ctx| terminal.input().clone());
+        let input_text_before = input.read(&app, |input, ctx| input.buffer_text(ctx));
+        assert!(!terminal.read(&app, |view, _ctx| view.is_context_menu_open()));
+
+        rerender!();
+        app.update(enclose!((presenter) move |ctx| {
+            ctx.simulate_window_event(
+                warpui::Event::RightMouseDown {
+                    position,
+                    cmd: false,
+                    shift: true,
+                    click_count: 1,
+                },
+                window_id,
+                presenter.clone(),
+            );
+        }));
+
+        assert!(
+            terminal.read(&app, |view, _ctx| view.is_context_menu_open()),
+            "Shift+right-click must open the block's context menu, even when right-click-pastes is enabled"
+        );
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "Shift+right-click must never paste to the PTY, got {:?}",
+            pty_writes.borrow()
+        );
+        input.read(&app, |input, ctx| {
+            assert_eq!(
+                input.buffer_text(ctx),
+                input_text_before,
+                "Shift+right-click must never paste into the input box"
+            );
+        });
+    })
+}
+
+#[test]
+fn alt_screen_shift_right_click_opens_context_menu_when_right_click_pastes() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        let mut updated = EntityIdSet::default();
+        updated.insert(app.root_view_id(window_id).unwrap());
+        let invalidation = WindowInvalidation {
+            updated,
+            ..Default::default()
+        };
+        let presenter = Rc::new(RefCell::new(Presenter::new(window_id)));
+
+        let size_info = terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.set_mode(ansi::Mode::SwapScreen {
+                save_cursor_and_clear_screen: true,
+            });
+            assert!(model.is_alt_screen_active());
+            // No mouse reporting is enabled, so Warp -- not the alt-screen application -- owns
+            // this right-click, with or without Shift.
+            assert!(should_intercept_mouse(&model, false, ctx));
+            assert!(should_intercept_mouse(&model, true, ctx));
+            *view.size_info
+        });
+
+        SelectionSettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .right_click_behavior
+                .set_value(RightClickBehavior::Paste, ctx);
+        });
+
+        macro_rules! rerender {
+            () => {
+                app.update(enclose!((presenter, invalidation) move |ctx| {
+                    presenter
+                        .borrow_mut()
+                        .invalidate(invalidation, ctx);
+                    presenter.borrow_mut().build_scene(
+                        vec2f(size_info.pane_width_px, size_info.pane_height_px),
+                        1.,
+                        None,
+                        ctx,
+                    );
+                }));
+            };
+        }
+
+        let position = vec2f(
+            2. * size_info.cell_width_px.as_f32(),
+            2. * size_info.cell_height_px.as_f32() - 1.,
+        );
+
+        let input = terminal.read(&app, |terminal, _ctx| terminal.input().clone());
+        let input_text_before = input.read(&app, |input, ctx| input.buffer_text(ctx));
+        assert!(!terminal.read(&app, |view, _ctx| view.is_context_menu_open()));
+
+        rerender!();
+        app.update(enclose!((presenter) move |ctx| {
+            ctx.simulate_window_event(
+                warpui::Event::RightMouseDown {
+                    position,
+                    cmd: false,
+                    shift: true,
+                    click_count: 1,
+                },
+                window_id,
+                presenter.clone(),
+            );
+        }));
+
+        assert!(
+            terminal.read(&app, |view, _ctx| view.is_context_menu_open()),
+            "Shift+right-click must open the alt-screen context menu, even when right-click-pastes is enabled"
+        );
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "Shift+right-click must never paste to the PTY, got {:?}",
+            pty_writes.borrow()
+        );
+        input.read(&app, |input, ctx| {
+            assert_eq!(
+                input.buffer_text(ctx),
+                input_text_before,
+                "Shift+right-click must never paste into the input box"
+            );
+        });
+    })
+}
+
+#[test]
+fn input_shift_right_click_opens_context_menu_when_right_click_pastes() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        let mut updated = EntityIdSet::default();
+        updated.insert(app.root_view_id(window_id).unwrap());
+        let invalidation = WindowInvalidation {
+            updated,
+            ..Default::default()
+        };
+        let presenter = Rc::new(RefCell::new(Presenter::new(window_id)));
+
+        let size_info = terminal.read(&app, |view, _ctx| *view.size_info);
+
+        SelectionSettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .right_click_behavior
+                .set_value(RightClickBehavior::Paste, ctx);
+        });
+
+        macro_rules! rerender {
+            () => {
+                app.update(enclose!((presenter, invalidation) move |ctx| {
+                    presenter
+                        .borrow_mut()
+                        .invalidate(invalidation, ctx);
+                    presenter.borrow_mut().build_scene(
+                        vec2f(size_info.pane_width_px, size_info.pane_height_px),
+                        1.,
+                        None,
+                        ctx,
+                    );
+                }));
+            };
+        }
+
+        // The input box is docked to the very bottom of the pane, below the block list.
+        let position = vec2f(
+            2. * size_info.cell_width_px.as_f32(),
+            size_info.pane_height_px - 0.5 * size_info.cell_height_px.as_f32(),
+        );
+
+        let input = terminal.read(&app, |terminal, _ctx| terminal.input().clone());
+        let input_text_before = input.read(&app, |input, ctx| input.buffer_text(ctx));
+        assert!(!terminal.read(&app, |view, _ctx| view.is_context_menu_open()));
+
+        rerender!();
+        app.update(enclose!((presenter) move |ctx| {
+            ctx.simulate_window_event(
+                warpui::Event::RightMouseDown {
+                    position,
+                    cmd: false,
+                    shift: true,
+                    click_count: 1,
+                },
+                window_id,
+                presenter.clone(),
+            );
+        }));
+
+        assert!(
+            terminal.read(&app, |view, _ctx| view.is_context_menu_open()),
+            "Shift+right-click on the input box must open its context menu, even when right-click-pastes is enabled"
+        );
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "Shift+right-click must never paste to the PTY, got {:?}",
+            pty_writes.borrow()
+        );
+        input.read(&app, |input, ctx| {
+            assert_eq!(
+                input.buffer_text(ctx),
+                input_text_before,
+                "Shift+right-click must never paste into the input box"
+            );
+        });
+    })
+}
+
+#[test]
+fn waterfall_background_right_click_honors_right_click_pastes_setting() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        terminal.update(&mut app, |_view, ctx| {
+            InputModeSettings::handle(ctx).update(ctx, |input_mode_settings, ctx| {
+                let _ = input_mode_settings
+                    .input_mode
+                    .set_value(InputMode::Waterfall, ctx);
+            });
+        });
+
+        SelectionSettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .right_click_behavior
+                .set_value(RightClickBehavior::Paste, ctx);
+        });
+
+        app.update(|ctx| {
+            ctx.clipboard().write(ClipboardContent::plain_text(
+                "waterfall-paste-test".to_string(),
+            ));
+        });
+
+        let mut updated = EntityIdSet::default();
+        updated.insert(app.root_view_id(window_id).unwrap());
+        let invalidation = WindowInvalidation {
+            updated,
+            ..Default::default()
+        };
+        let presenter = Rc::new(RefCell::new(Presenter::new(window_id)));
+
+        let size_info = terminal.read(&app, |view, _ctx| *view.size_info);
+
+        macro_rules! rerender {
+            () => {
+                app.update(enclose!((presenter, invalidation) move |ctx| {
+                    presenter
+                        .borrow_mut()
+                        .invalidate(invalidation, ctx);
+                    presenter.borrow_mut().build_scene(
+                        vec2f(size_info.pane_width_px, size_info.pane_height_px),
+                        1.,
+                        None,
+                        ctx,
+                    );
+                }));
+            };
+        }
+
+        // With no blocks, both the block content height and the input's saved position height
+        // are zero, so any position within the pane satisfies "outside the block"; pick a point
+        // near the bottom of the pane, comfortably inside its bounds.
+        let position = vec2f(
+            2. * size_info.cell_width_px.as_f32(),
+            size_info.pane_height_px - 0.1,
+        );
+
+        let input = terminal.read(&app, |terminal, _ctx| terminal.input().clone());
+        assert!(!terminal.read(&app, |view, _ctx| view.is_context_menu_open()));
+
+        rerender!();
+        app.update(enclose!((presenter) move |ctx| {
+            ctx.simulate_window_event(
+                warpui::Event::RightMouseDown {
+                    position,
+                    cmd: false,
+                    shift: false,
+                    click_count: 1,
+                },
+                window_id,
+                presenter.clone(),
+            );
+        }));
+
+        assert!(
+            !terminal.read(&app, |view, _ctx| view.is_context_menu_open()),
+            "a bare right-click on the waterfall background must paste, not open the context menu"
+        );
+        input.read(&app, |input, ctx| {
+            assert_eq!(
+                input.buffer_text(ctx),
+                "waterfall-paste-test",
+                "a bare right-click on the waterfall background must paste the clipboard into the input"
+            );
+        });
+
+        // Reset the input, then confirm Shift still reveals the context menu instead.
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("", ctx);
+        });
+
+        rerender!();
+        app.update(enclose!((presenter) move |ctx| {
+            ctx.simulate_window_event(
+                warpui::Event::RightMouseDown {
+                    position,
+                    cmd: false,
+                    shift: true,
+                    click_count: 1,
+                },
+                window_id,
+                presenter.clone(),
+            );
+        }));
+
+        assert!(
+            terminal.read(&app, |view, _ctx| view.is_context_menu_open()),
+            "Shift+right-click on the waterfall background must open the context menu, even when right-click-pastes is enabled"
+        );
+        input.read(&app, |input, ctx| {
+            assert_eq!(
+                input.buffer_text(ctx),
+                "",
+                "Shift+right-click must never paste into the input box"
+            );
+        });
+    })
+}
+
+/// Registers a rich-status-capable, `InProgress` CLI agent session that has
+/// already observed a `prompt_submit` -- the state a real working third-party
+/// harness turn is in -- so `observe_ctrl_c_write` is able to arm.
+fn register_armable_cli_agent_session(app: &mut App, view_id: EntityId) {
+    let cli_sessions = CLIAgentSessionsModel::handle(app);
+    cli_sessions.update(app, |sessions, ctx| {
+        sessions.set_session(
+            view_id,
+            CLIAgentSession {
+                agent: CLIAgent::Claude,
+                status: CLIAgentSessionStatus::InProgress,
+                session_context: CLIAgentSessionContext::default(),
+                input_state: CLIAgentInputState::Closed,
+                should_auto_toggle_input: false,
+                listener: None,
+                plugin_version: None,
+                remote_host: None,
+                draft_text: None,
+                custom_command_prefix: None,
+                received_rich_notification: true,
+            },
+            ctx,
+        );
+    });
+    cli_sessions.update(app, |sessions, ctx| {
+        sessions.update_from_event(
+            view_id,
+            &CLIAgentEvent {
+                v: 1,
+                agent: CLIAgent::Claude,
+                event: CLIAgentEventType::PromptSubmit,
+                session_id: None,
+                cwd: None,
+                project: None,
+                payload: CLIAgentEventPayload::default(),
+                source: CLIAgentEventSource::RichPlugin,
+            },
+            ctx,
+        );
+    });
+}
+
+#[test]
+fn ctrl_c_from_shared_viewer_forwards_and_arms_cancel_window() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _flag = FeatureFlag::CtrlCCancelsThirdPartyHarness.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let view_id = terminal.id();
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        register_armable_cli_agent_session(&mut app, view_id);
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().simulate_long_running_block("claude", "");
+            view.write_viewer_bytes_to_pty(vec![0x03], ctx);
+        });
+
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![vec![0x03]],
+            "Ctrl-C must still be forwarded to the pty unchanged"
+        );
+        let armed = CLIAgentSessionsModel::handle(&app).read(&app, |sessions, _| {
+            sessions.has_pending_or_resolved_ctrl_c_cancel(view_id)
+        });
+        assert!(
+            armed,
+            "a forwarded Ctrl-C to a working rich-status session should arm the cancel window"
+        );
+    })
+}
+
+#[test]
+fn ctrl_c_from_shared_viewer_rejected_by_agent_in_control_does_not_arm_cancel_window() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _flag = FeatureFlag::CtrlCCancelsThirdPartyHarness.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let view_id = terminal.id();
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        register_armable_cli_agent_session(&mut app, view_id);
+        terminal.update(&mut app, |view, ctx| {
+            {
+                let mut model = view.model.lock();
+                model.simulate_long_running_block("claude", "");
+                let task_id = TaskId::new("test-task".to_owned());
+                model
+                    .block_list_mut()
+                    .active_block_mut()
+                    .set_agent_interaction_mode_for_agent_monitored_command(
+                        &task_id,
+                        AIConversationId::new(),
+                    )
+                    .expect("user-mode block should become agent-monitored");
+                assert!(
+                    model.block_list().active_block().is_agent_in_control(),
+                    "active block should be agent-controlled for this test"
+                );
+            }
+
+            // `write_user_bytes_to_pty` rejects writes while the agent is in
+            // control of the command, so this Ctrl-C never reaches the pty.
+            view.write_viewer_bytes_to_pty(vec![0x03], ctx);
+        });
+
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "a rejected write must not reach the pty"
+        );
+        let armed = CLIAgentSessionsModel::handle(&app).read(&app, |sessions, _| {
+            sessions.has_pending_or_resolved_ctrl_c_cancel(view_id)
+        });
+        assert!(
+            !armed,
+            "a Ctrl-C that never reached the pty must not arm the cancel window"
         );
     })
 }
@@ -354,6 +1546,85 @@ fn update_exchange_input_and_handle_event(
     );
 }
 
+fn enter_agent_view_for_navigation(
+    view: &mut TerminalView,
+    ctx: &mut ViewContext<TerminalView>,
+) -> AIConversationId {
+    view.agent_view_controller().update(ctx, |controller, ctx| {
+        controller
+            .try_enter_agent_view(
+                None,
+                AgentViewEntryOrigin::Input {
+                    was_prompt_autodetected: false,
+                },
+                ctx,
+            )
+            .expect("agent view entry should succeed")
+    })
+}
+
+fn append_inputs_to_conversation_and_handle_event(
+    view: &mut TerminalView,
+    conversation_id: AIConversationId,
+    inputs: Vec<AIAgentInput>,
+    ctx: &mut ViewContext<TerminalView>,
+) {
+    let history_model = BlocklistAIHistoryModel::handle(ctx);
+    let (exchange_id, task_id, response_stream_id) =
+        history_model.update(ctx, |history_model, ctx| {
+            let response_stream_id = ResponseStreamId::new_for_test();
+            let exchange = exchange_with_inputs(inputs);
+            let exchange_id = exchange.id;
+            let task_id = history_model
+                .conversation(&conversation_id)
+                .expect("conversation should exist")
+                .get_root_task_id()
+                .clone();
+            history_model
+                .conversation_mut(&conversation_id)
+                .expect("conversation should exist")
+                .append_reassigned_exchange(&response_stream_id, exchange, view.view_id, ctx)
+                .expect("exchange should append");
+            (exchange_id, task_id, response_stream_id)
+        });
+    view.handle_ai_history_model_event(
+        history_model,
+        &BlocklistAIHistoryEvent::AppendedExchange {
+            exchange_id,
+            task_id,
+            terminal_surface_id: view.view_id,
+            conversation_id,
+            is_hidden: false,
+            response_stream_id: Some(response_stream_id),
+        },
+        ctx,
+    );
+}
+
+fn agent_view_user_query_input(query: &str) -> AIAgentInput {
+    AIAgentInput::UserQuery {
+        query: query.to_owned(),
+        context: Default::default(),
+        static_query_type: None,
+        referenced_attachments: Default::default(),
+        user_query_mode: UserQueryMode::Normal,
+        running_command: None,
+        intended_agent: None,
+    }
+}
+
+fn simulate_user_shell_block_in_conversation(
+    view: &mut TerminalView,
+    conversation_id: AIConversationId,
+    command: &str,
+) -> BlockIndex {
+    let mut model = view.model.lock();
+    model.simulate_block(command, "shell-output");
+    let index = model.block_list().blocks().len() - 2;
+    model.block_list_mut().blocks_mut()[index].set_conversation_id(conversation_id);
+    index.into()
+}
+
 fn ai_block_count(view: &TerminalView) -> usize {
     view.rich_content_views
         .iter()
@@ -430,6 +1701,148 @@ fn set_active_block_agent_driving(view: &mut TerminalView, conversation_id: AICo
         .block_list_mut()
         .active_block_mut()
         .set_agent_interaction_mode_for_requested_command(action_id, None, conversation_id);
+}
+
+fn auto_code_diff_query_input(query: &str) -> AIAgentInput {
+    AIAgentInput::AutoCodeDiffQuery {
+        query: query.to_owned(),
+        context: Default::default(),
+    }
+}
+
+#[test]
+fn is_passive_conversation_reflects_request_type_at_construction() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            append_exchange_and_handle_event(view, auto_code_diff_query_input("diff"), ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let ai_block = view.last_ai_block().expect("AI block should exist");
+            assert!(ai_block.as_ref(ctx).is_passive_conversation());
+        });
+    })
+}
+
+#[test]
+fn is_passive_conversation_is_false_for_a_directly_issued_user_query() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            append_exchange_and_handle_event(view, agent_view_user_query_input("hi"), ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let ai_block = view.last_ai_block().expect("AI block should exist");
+            assert!(!ai_block.as_ref(ctx).is_passive_conversation());
+        });
+    })
+}
+
+#[test]
+fn is_passive_conversation_is_recomputed_on_conversation_reassignment() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        let (old_conversation_id, _task_id, exchange_id, _stream_id) =
+            terminal.update(&mut app, |view, ctx| {
+                append_exchange_and_handle_event(view, auto_code_diff_query_input("diff"), ctx)
+            });
+
+        terminal.read(&app, |view, ctx| {
+            let ai_block = view.last_ai_block().expect("AI block should exist");
+            assert!(ai_block.as_ref(ctx).is_passive_conversation());
+        });
+
+        // Move the exchange to a new conversation, as happens on a conversation split. This is
+        // a separate app update from the manual reset below so the `ReassignedExchange` event
+        // emitted by `append_reassigned_exchange` (which would rebuild a real, still-passive
+        // `AIBlockModelImpl` and reassert the cache) is fully processed first.
+        let new_conversation_id = terminal.update(&mut app, |view, ctx| {
+            let history_model = BlocklistAIHistoryModel::handle(ctx);
+            history_model.update(ctx, |history_model, ctx| {
+                let new_conversation_id =
+                    history_model.start_new_conversation(view.view_id, false, false, false, ctx);
+                let exchange = history_model
+                    .conversation_mut(&old_conversation_id)
+                    .expect("old conversation should exist")
+                    .remove_exchange(exchange_id)
+                    .expect("exchange should exist");
+                let response_stream_id = ResponseStreamId::new_for_test();
+                history_model
+                    .conversation_mut(&new_conversation_id)
+                    .expect("new conversation should exist")
+                    .append_reassigned_exchange(&response_stream_id, exchange, view.view_id, ctx)
+                    .expect("exchange should reassign");
+                new_conversation_id
+            })
+        });
+
+        // Now reset the block directly onto a model that classifies as `Active` — the opposite
+        // of what's currently cached. A `reset_conversation_id` that forgot to refresh
+        // `is_passive` would keep reporting the stale, now-incorrect cached value instead of the
+        // new model's.
+        terminal.update(&mut app, |view, ctx| {
+            let ai_block = view.last_ai_block().expect("AI block should exist");
+            let active_model = Rc::new(FakeAIBlockModel::new(
+                vec![agent_view_user_query_input("hi")],
+                AIAgentOutput::default(),
+            ));
+            ai_block.update(ctx, |block, ctx| {
+                block.reset_conversation_id(new_conversation_id, active_model, ctx);
+            });
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let ai_block = view.last_ai_block().expect("AI block should exist");
+            assert!(!ai_block.as_ref(ctx).is_passive_conversation());
+            assert_eq!(
+                BlocklistAIHistoryModel::as_ref(ctx)
+                    .conversation(&new_conversation_id)
+                    .and_then(|c| c.exchange_with_id(exchange_id))
+                    .map(|e| e.id),
+                Some(exchange_id)
+            );
+        });
+    })
+}
+
+#[test]
+fn is_passive_conversation_does_not_re_derive_from_history_after_construction() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        let (conversation_id, _task_id, exchange_id, _stream_id) =
+            terminal.update(&mut app, |view, ctx| {
+                append_exchange_and_handle_event(view, auto_code_diff_query_input("diff"), ctx)
+            });
+
+        // Strip the backing exchange out of history after construction. A live re-derivation
+        // (`AIBlockModelImpl::request_type` failing to find the exchange) falls back to
+        // `AIRequestType::Active`, so this only keeps returning `true` if the value was cached
+        // at construction time rather than looked up on every call.
+        terminal.update(&mut app, |_view, ctx| {
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, _ctx| {
+                history_model
+                    .conversation_mut(&conversation_id)
+                    .expect("conversation should exist")
+                    .remove_exchange(exchange_id)
+                    .expect("exchange should exist");
+            });
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let ai_block = view.last_ai_block().expect("AI block should exist");
+            assert!(ai_block.as_ref(ctx).is_passive_conversation());
+        });
+    })
 }
 
 #[test]
@@ -2027,7 +3440,7 @@ fn cloud_mode_dispatched_agent_inserts_queued_user_query() {
                             mode: UserQueryMode::Normal,
                             config: None,
                             title: None,
-                            team: None,
+                            team: Some(false),
                             agent_identity_uid: None,
                             skill: None,
                             attachments: vec![],
@@ -2040,6 +3453,7 @@ fn cloud_mode_dispatched_agent_inserts_queued_user_query() {
                             snapshot_disabled: None,
                             orchestration_handoff: None,
                         },
+                        RequestTeamScope::from_scope(&TeamlessScopeForTest),
                         ctx,
                     );
                 });
@@ -2623,6 +4037,174 @@ fn test_clear_session_flag_state() {
                 !view.any_session_contains_restored_remote_blocks,
                 "Terminal should not have restored remote blocks after clearing"
             );
+        });
+    })
+}
+
+/// Regression: publishing only under a forbidding policy meant a later revocation found nothing
+/// published and left AI enabled mid-remote-session. The focused terminal must publish its
+/// remote content regardless of the current permission.
+#[test]
+fn focused_terminal_publishes_remote_blocks_while_remote_session_ai_is_still_permitted() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+        UserWorkspaces::handle(&app).update(&mut app, |user_workspaces, ctx| {
+            user_workspaces.setup_test_workspace(ctx);
+            user_workspaces.update_current_workspace(
+                |workspace| {
+                    workspace
+                        .teams
+                        .first_mut()
+                        .expect("the fixture workspace has a team")
+                        .settings
+                        .ai_permissions
+                        .allow_ai_in_remote_sessions
+                        .value = true;
+                },
+                ctx,
+            );
+            let team_uid = user_workspaces
+                .sole_team_uid()
+                .expect("the fixture workspace has exactly one team");
+            user_workspaces.set_team_for_window(window_id, team_uid, ctx);
+        });
+
+        app.read(|ctx| {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
+            let scope = user_workspaces.team_context(&terminal.downgrade(), ctx);
+            assert!(
+                user_workspaces.is_ai_allowed_in_remote_sessions(&scope),
+                "precondition: the permissive policy that used to suppress publishing"
+            );
+            assert!(!FocusedTerminalInfo::as_ref(ctx).contains_any_remote_blocks());
+        });
+
+        terminal.update(&mut app, |_view, ctx| ctx.focus_self());
+
+        terminal.update(&mut app, |view, ctx| {
+            assert!(ctx.is_self_or_child_focused());
+            view.any_session_contains_remote_blocks = true;
+            view.update_focused_terminal_info(ctx);
+        });
+
+        app.read(|ctx| {
+            let focused_terminal = FocusedTerminalInfo::as_ref(ctx);
+            assert!(focused_terminal.contains_any_remote_blocks());
+            assert_eq!(
+                focused_terminal.terminal().map(|handle| handle.id()),
+                Some(terminal.id()),
+                "the flags name the surface they came from"
+            );
+        });
+    })
+}
+
+/// The permission is re-minted on every decision from the focused terminal's handle, so an
+/// admin revoking it takes effect immediately rather than waiting for a new session or a fresh
+/// publish.
+#[test]
+fn revoking_remote_session_ai_takes_effect_without_a_new_terminal_session() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        UserWorkspaces::handle(&app).update(&mut app, |user_workspaces, ctx| {
+            user_workspaces.setup_test_workspace(ctx);
+            user_workspaces.update_current_workspace(
+                |workspace| {
+                    workspace
+                        .teams
+                        .first_mut()
+                        .expect("the fixture workspace has a team")
+                        .settings
+                        .ai_permissions
+                        .allow_ai_in_remote_sessions
+                        .value = true;
+                },
+                ctx,
+            );
+            let team_uid = user_workspaces
+                .sole_team_uid()
+                .expect("the fixture workspace has exactly one team");
+            user_workspaces.set_team_for_window(window_id, team_uid, ctx);
+        });
+
+        terminal.update(&mut app, |_view, ctx| ctx.focus_self());
+        terminal.update(&mut app, |view, ctx| {
+            view.any_session_contains_remote_blocks = true;
+            view.update_focused_terminal_info(ctx);
+        });
+
+        app.read(|ctx| {
+            assert!(!AISettings::as_ref(ctx).is_ai_disabled_due_to_remote_session_org_policy(ctx));
+        });
+
+        UserWorkspaces::handle(&app).update(&mut app, |user_workspaces, ctx| {
+            user_workspaces.update_current_workspace(
+                |workspace| {
+                    workspace
+                        .teams
+                        .first_mut()
+                        .expect("the fixture workspace has a team")
+                        .settings
+                        .ai_permissions
+                        .allow_ai_in_remote_sessions
+                        .value = false;
+                },
+                ctx,
+            );
+        });
+
+        app.read(|ctx| {
+            assert!(
+                AISettings::as_ref(ctx).is_ai_disabled_due_to_remote_session_org_policy(ctx),
+                "revocation takes effect on the next read, with no new session or fresh publish"
+            );
+        });
+    })
+}
+
+/// A block's remoteness is a question of fact, so the team's command patterns classify it even
+/// when that team currently permits AI in remote sessions.
+#[test]
+fn org_command_patterns_classify_a_block_remote_even_when_remote_session_ai_is_permitted() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        UserWorkspaces::handle(&app).update(&mut app, |user_workspaces, ctx| {
+            user_workspaces.setup_test_workspace(ctx);
+            user_workspaces.update_current_workspace(
+                |workspace| {
+                    let team = workspace
+                        .teams
+                        .first_mut()
+                        .expect("the fixture workspace has a team");
+                    team.settings
+                        .ai_permissions
+                        .allow_ai_in_remote_sessions
+                        .value = true;
+                    team.settings.ai_permissions.remote_session_regex_list =
+                        vec![Regex::new("^kubectl").expect("test pattern should compile")];
+                },
+                ctx,
+            );
+            let team_uid = user_workspaces
+                .sole_team_uid()
+                .expect("the fixture workspace has exactly one team");
+            user_workspaces.set_team_for_window(window_id, team_uid, ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
+            let scope = user_workspaces.team_context(&terminal.downgrade(), ctx);
+            assert!(
+                user_workspaces.is_ai_allowed_in_remote_sessions(&scope),
+                "precondition: the team permits AI and only configures patterns"
+            );
+            assert!(view.is_block_considered_remote(None, Some("kubectl get pods"), ctx));
+            assert!(!view.is_block_considered_remote(None, Some("ls -la"), ctx));
         });
     })
 }
@@ -4525,6 +6107,67 @@ fn test_banner_for_incompatible_plugins() {
     })
 }
 
+/// Regression test for #9011: the slow-bootstrap banner used to persist
+/// indefinitely when shell integration never sent the bootstrap signal
+/// (e.g. the user's shell `exec`s into `expect` before Warp's integration
+/// runs). The auto-dismiss timer scheduled when the banner opens must
+/// eventually close it.
+#[test]
+fn test_slow_bootstrap_banner_auto_dismisses() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal =
+            MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+        // Open the banner directly and schedule a short-duration auto-dismiss
+        // timer. We bypass `on_bootstrap_failed_timer_complete` (which itself
+        // waits the 7-second bootstrap timeout) to keep this test fast — the
+        // important behavior under test is the auto-dismiss path.
+        terminal.update(&mut app, |view, ctx| {
+            view.is_slow_bootstrap_banner_open = true;
+            view.slow_bootstrap_banner_auto_dismiss_handle = Some(
+                view.start_slow_bootstrap_banner_auto_dismiss_timer(Duration::from_millis(50), ctx),
+            );
+        });
+
+        assert!(terminal.read(&app, |view, _ctx| view.is_slow_bootstrap_banner_open));
+
+        assert_eventually!(
+            200 => terminal.read(&app, |view, _ctx| !view.is_slow_bootstrap_banner_open
+                && view.slow_bootstrap_banner_auto_dismiss_handle.is_none()),
+            "Slow bootstrap banner did not auto-dismiss"
+        );
+    })
+}
+
+/// Regression test for #9011: when the banner is dismissed by another path
+/// (manual user dismissal or a successful bootstrap event), any pending
+/// auto-dismiss timer should be aborted so it can't fire after the fact.
+#[test]
+fn test_hide_slow_bootstrap_banner_aborts_pending_auto_dismiss() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal =
+            MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.is_slow_bootstrap_banner_open = true;
+            view.slow_bootstrap_banner_auto_dismiss_handle =
+                Some(view.start_slow_bootstrap_banner_auto_dismiss_timer(
+                    // Long enough that the timer can't fire before we hide.
+                    Duration::from_secs(60),
+                    ctx,
+                ));
+            view.hide_slow_bootstrap_banner(ctx);
+        });
+
+        terminal.read(&app, |view, _ctx| {
+            assert!(!view.is_slow_bootstrap_banner_open);
+            assert!(view.slow_bootstrap_banner_auto_dismiss_handle.is_none());
+        });
+    })
+}
+
 // Regression test for GH#3548 / GH#6093: the "Seems like your completions are not
 // working" banner must offer a permanent "Don't show me again" dismissal that is
 // persisted, while the "x" close button keeps its existing per-session behavior.
@@ -5157,6 +6800,19 @@ fn agent_footer_updates_chip_groups_when_side_assignment_changes() {
         FeatureFlag::AgentView.set_enabled(true);
 
         let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            view.agent_view_controller().update(ctx, |controller, ctx| {
+                controller
+                    .try_enter_agent_view(
+                        None,
+                        AgentViewEntryOrigin::Input {
+                            was_prompt_autodetected: false,
+                        },
+                        ctx,
+                    )
+                    .expect("Should be able to enter agent view");
+            });
+        });
 
         terminal.update(&mut app, |view, ctx| {
             let model = view.model.lock();
@@ -6299,6 +7955,47 @@ fn submit_cli_agent_rich_input_codex_uses_bracketed_paste() {
     })
 }
 
+/// Verifies that multi-line Hermes rich input is delivered as a single bracketed
+/// paste payload with a standalone \r submit. Embedded newlines must remain
+/// inside the paste instead of triggering separate submissions.
+#[test]
+fn submit_cli_agent_rich_input_hermes_multiline_uses_bracketed_paste() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        let (_terminal, pty_writes) =
+            submit_rich_input_and_collect_pty_writes(&mut app, CLIAgent::Hermes, "line1\nline2");
+
+        let writes = pty_writes.borrow();
+        // BracketedPaste: first write is ESC[200~ + both lines + ESC[201~, second is \r.
+        // The embedded \n between lines must NOT split into a separate write or trigger
+        // a second submission — that was the voice-input auto-submit regression.
+        assert_eq!(
+            writes.len(),
+            2,
+            "expected 2 PTY writes (paste payload + submit \r), got {}: {:?}",
+            writes.len(),
+            writes
+        );
+
+        let mut expected_paste =
+            Vec::with_capacity(BRACKETED_PASTE_START.len() + 11 + BRACKETED_PASTE_END.len());
+        expected_paste.extend_from_slice(BRACKETED_PASTE_START);
+        expected_paste.extend_from_slice(b"line1\nline2");
+        expected_paste.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(
+            writes[0], expected_paste,
+            "first write should be the full bracketed paste payload"
+        );
+        assert_eq!(
+            writes[1], b"\r",
+            "second write should be the standalone submit \r"
+        );
+    })
+}
+
 #[test]
 fn submit_cli_agent_rich_input_opencode_defers_enter_and_close() {
     App::test((), |mut app| async move {
@@ -6316,7 +8013,7 @@ fn submit_cli_agent_rich_input_opencode_defers_enter_and_close() {
 
         // Wait for the delayed \r to arrive.
         assert_eventually!(
-            pty_writes.borrow().len() == 2,
+            100 => pty_writes.borrow().len() == 2,
             "carriage return should be written after delay"
         );
         assert_eq!(pty_writes.borrow()[1], b"\r");
@@ -6692,7 +8389,7 @@ fn submit_with_plugin_but_auto_toggle_off_respects_auto_dismiss() {
         // auto_toggle is off, so auto_dismiss closes rich input.
         // Claude uses DelayedEnter, so the close happens after a timer.
         assert_eventually!(
-            terminal.read(&app, |view, ctx| !view
+            100 => terminal.read(&app, |view, ctx| !view
                 .has_active_cli_agent_input_session(ctx)),
             "Rich input should be closed after submit with auto_dismiss"
         );
@@ -6952,6 +8649,8 @@ fn cli_session_status_updates_active_child_conversation() {
         let _agent_view = FeatureFlag::AgentView.override_enabled(true);
 
         let terminal = add_window_with_terminal(&mut app, None);
+        let task_id = AmbientAgentTaskId::from_str("123e4567-e89b-12d3-a456-426614174000")
+            .expect("valid task id");
 
         let child_conversation_id = terminal.update(&mut app, |view, ctx| {
             let parent_conversation_id =
@@ -6960,13 +8659,19 @@ fn cli_session_status_updates_active_child_conversation() {
                 });
             let child_conversation_id =
                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
-                    history_model.start_new_child_conversation(
+                    let child_conversation_id = history_model.start_new_child_conversation(
                         view.view_id,
                         "Agent 2".to_string(),
                         parent_conversation_id,
                         None,
+                        false,
                         ctx,
-                    )
+                    );
+                    history_model
+                        .conversation_mut(&child_conversation_id)
+                        .expect("child conversation should exist")
+                        .set_task_id(task_id);
+                    child_conversation_id
                 });
 
             view.enter_agent_view(
@@ -6975,6 +8680,13 @@ fn cli_session_status_updates_active_child_conversation() {
                 AgentViewEntryOrigin::ChildAgent,
                 ctx,
             );
+
+            // Status updates only route to a conversation whose `task_id` matches
+            // the ambient task this pane's CLI-harness session is registered
+            // under (see `TerminalView::conversation_id_for_cli_status_updates`).
+            LocalAgentTaskSyncModel::handle(ctx).update(ctx, |sync_model, _ctx| {
+                sync_model.register_cli_session_for_test(view.view_id, task_id);
+            });
 
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
                 sessions.set_session(
@@ -7104,6 +8816,8 @@ fn cli_session_status_updates_single_child_conversation_without_agent_view() {
         let _agent_view = FeatureFlag::AgentView.override_enabled(true);
 
         let terminal = add_window_with_terminal(&mut app, None);
+        let task_id = AmbientAgentTaskId::from_str("123e4567-e89b-12d3-a456-426614174000")
+            .expect("valid task id");
 
         let child_conversation_id = terminal.update(&mut app, |view, ctx| {
             let parent_conversation_id =
@@ -7112,14 +8826,27 @@ fn cli_session_status_updates_single_child_conversation_without_agent_view() {
                 });
             let child_conversation_id =
                 BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
-                    history_model.start_new_child_conversation(
+                    let child_conversation_id = history_model.start_new_child_conversation(
                         view.view_id,
                         "Agent 2".to_string(),
                         parent_conversation_id,
                         None,
+                        false,
                         ctx,
-                    )
+                    );
+                    history_model
+                        .conversation_mut(&child_conversation_id)
+                        .expect("child conversation should exist")
+                        .set_task_id(task_id);
+                    child_conversation_id
                 });
+
+            // Status updates only route to a conversation whose `task_id` matches
+            // the ambient task this pane's CLI-harness session is registered
+            // under (see `TerminalView::conversation_id_for_cli_status_updates`).
+            LocalAgentTaskSyncModel::handle(ctx).update(ctx, |sync_model, _ctx| {
+                sync_model.register_cli_session_for_test(view.view_id, task_id);
+            });
 
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
                 sessions.set_session(
@@ -8057,4 +9784,511 @@ fn cmd_k_in_agent_view_cancels_in_progress_conversation_and_starts_new_one() {
             );
         });
     })
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn copy_forwards_etx_to_pty_on_linux_alt_screen_without_warp_selection() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            // Enter the alt screen (a fullscreen TUI is in control) and add no
+            // Warp-visible selection of any kind.
+            {
+                let mut model = view.model.lock();
+                model.set_mode(ansi::Mode::SwapScreen {
+                    save_cursor_and_clear_screen: true,
+                });
+                assert!(model.is_alt_screen_active());
+            }
+            assert_eq!("", &read_from_clipboard(ctx));
+
+            // No CLI-subagent / error-screen / grid / input-editor / block
+            // selection exists, so `copy()` reaches the new fallback. The clipboard
+            // is written synchronously, but `WriteBytesToPty` events are dispatched
+            // after the update closure returns, so the PTY-write assertion is made
+            // outside the closure (mirroring `ctrl_c_after_stop_takeover_cancels_conversation`).
+            view.handle_action(&TerminalAction::Copy, ctx);
+
+            assert_eq!(
+                read_from_clipboard(ctx),
+                "",
+                "Copy must not write anything to the clipboard when Warp has no selection"
+            );
+        });
+
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![vec![C0::ETX]],
+            "Copy on Linux alt screen with no Warp selection must forward exactly one ETX byte to the PTY"
+        );
+    })
+}
+
+#[test]
+fn copy_does_not_forward_when_alt_screen_has_warp_selection() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            {
+                // Enter the alt screen and add text the user will select in Warp.
+                let mut model = view.model.lock();
+                model.set_mode(ansi::Mode::SwapScreen {
+                    save_cursor_and_clear_screen: true,
+                });
+                assert!(model.is_alt_screen_active());
+
+                model.alt_screen_mut().input('h');
+            }
+
+            // Make a Warp-owned alt-screen selection (the path that copies today).
+            view.begin_alt_selection(Point::new(0, 0), Side::Left, SelectionType::Simple, ctx);
+            view.update_alt_selection(Point::new(0, 2), Side::Left, &Lines::zero(), ctx);
+            view.end_alt_selection(ctx);
+            // `end_alt_selection` copies via copy-on-select, so the clipboard now
+            // holds the selected text. Reset the PTY-write recorder so the only
+            // writes observed below come from the explicit Copy dispatch.
+            pty_writes.borrow_mut().clear();
+            assert_eq!("h", &read_from_clipboard(ctx));
+
+            view.handle_action(&TerminalAction::Copy, ctx);
+
+            assert_eq!(
+                read_from_clipboard(ctx),
+                "h",
+                "Copy must still copy the Warp alt-screen selection to the clipboard"
+            );
+        });
+
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "Copy must not forward ETX to the PTY when a Warp alt-screen selection was copied"
+        );
+    })
+}
+
+#[test]
+fn copy_does_not_forward_on_normal_screen() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            // Normal screen: no alt screen, no selection of any kind.
+            assert!(!view.model.lock().is_alt_screen_active());
+            assert_eq!("", &read_from_clipboard(ctx));
+
+            view.handle_action(&TerminalAction::Copy, ctx);
+
+            assert_eq!(
+                read_from_clipboard(ctx),
+                "",
+                "Copy must not write anything to the clipboard on the normal screen with no selection"
+            );
+        });
+
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "Copy must not write anything to the PTY on the normal screen with no selection"
+        );
+    })
+}
+
+/// Builds a minimal review batch with a single non-outdated general comment.
+fn single_general_review_comment(content: &str) -> AgentReviewCommentBatch {
+    AgentReviewCommentBatch {
+        comments: vec![AttachedReviewComment {
+            id: Default::default(),
+            content: content.to_string(),
+            target: AttachedReviewCommentTarget::General,
+            last_update_time: Local::now(),
+            base: None,
+            head: None,
+            outdated: false,
+            origin: CommentOrigin::Native,
+        }],
+        diff_set: HashMap::new(),
+    }
+}
+
+fn set_warp_tui_session(view: &mut TerminalView, ctx: &mut ViewContext<TerminalView>) {
+    view.model.lock().simulate_long_running_block("warp", "");
+    assert_eq!(
+        CLIAgent::detect("warp", None, None, ctx),
+        Some(CLIAgent::WarpTui)
+    );
+
+    CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+        sessions.set_session(
+            view.view_id,
+            CLIAgentSession {
+                agent: CLIAgent::WarpTui,
+                status: CLIAgentSessionStatus::InProgress,
+                session_context: CLIAgentSessionContext::default(),
+                input_state: CLIAgentInputState::Closed,
+                should_auto_toggle_input: false,
+                listener: None,
+                remote_host: None,
+                plugin_version: None,
+                draft_text: None,
+                custom_command_prefix: None,
+                received_rich_notification: false,
+            },
+            ctx,
+        );
+    });
+}
+
+#[test]
+fn warp_tui_listener_does_not_auto_open_rich_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .auto_open_rich_input_on_cli_agent_start
+                .set_value(true, ctx);
+        });
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_cli_agent_notification(
+                Some(CLI_AGENT_NOTIFICATION_SENTINEL),
+                r#"{"v":1,"agent":"warp-tui","event":"session_start"}"#,
+                ctx,
+            );
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let session = CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .expect("Warp TUI session should be registered");
+            assert!(session.listener.is_some());
+            assert!(!session.should_auto_toggle_input);
+            assert!(!view.has_active_cli_agent_input_session(ctx));
+        });
+    });
+}
+#[test]
+fn active_cli_agent_recognizes_detected_warp_tui_session() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _hoa_code_review = FeatureFlag::HoaCodeReview.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            set_warp_tui_session(view, ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(
+                view.active_cli_agent(ctx),
+                Some(CLIAgent::WarpTui),
+                "Warp TUI should be recognized as a code-review destination while running"
+            );
+        });
+    });
+}
+
+/// `active_cli_agent` must return `None` for the Warp TUI when `HoaCodeReview`
+/// is disabled, preserving the pre-feature behavior (no review destination).
+#[test]
+fn active_cli_agent_ignores_warp_tui_when_hoa_code_review_disabled() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _hoa_code_review = FeatureFlag::HoaCodeReview.override_enabled(false);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            set_warp_tui_session(view, ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(
+                view.active_cli_agent(ctx),
+                None,
+                "Warp TUI should not be a review destination when HoaCodeReview is disabled"
+            );
+        });
+    });
+}
+
+#[test]
+fn active_cli_agent_ignores_non_tui_long_running_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _hoa_code_review = FeatureFlag::HoaCodeReview.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, _| {
+            view.model.lock().simulate_long_running_block("vim", "");
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(CLIAgent::detect("vim", None, None, ctx), None);
+            assert_eq!(
+                view.active_cli_agent(ctx),
+                None,
+                "a non-TUI long-running command must not be a review destination"
+            );
+        });
+    });
+}
+
+/// Sending review comments while the Warp TUI is running writes the built prompt
+/// directly to the TUI's PTY rather than the outer rich input.
+#[test]
+fn send_review_comments_to_warp_tui_writes_prompt_to_pty() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _hoa_code_review = FeatureFlag::HoaCodeReview.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            set_warp_tui_session(view, ctx);
+            assert_eq!(view.active_cli_agent(ctx), Some(CLIAgent::WarpTui));
+            assert!(!view.is_cli_agent_rich_input_open(ctx));
+
+            let review = single_general_review_comment("please fix the off-by-one");
+            view.send_review_to_cli_agent_or_rich_input(&review, ctx)
+                .expect("send should succeed");
+        });
+
+        // The review prompt is written to the PTY in a single write because
+        // Warp TUI sessions do not open the outer rich input.
+        let writes = pty_writes.borrow();
+        assert_eq!(
+            writes.len(),
+            1,
+            "expected a single PTY write, got {writes:?}"
+        );
+        let prompt = std::str::from_utf8(&writes[0]).expect("prompt is valid UTF-8");
+        assert!(
+            prompt.contains("please fix the off-by-one"),
+            "PTY write should contain the review prompt, got: {prompt}"
+        );
+    });
+}
+
+#[test]
+fn back_button_label_names_the_direct_parent_at_depth() {
+    App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_history_persistence_for_tests(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+        let (root_id, mid_id, grandchild_id) = history_model.update(&mut app, |history, ctx| {
+            let root_id =
+                history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+            let mid_id = history.start_new_child_conversation(
+                terminal_view_id,
+                "api-refactor".to_string(),
+                root_id,
+                None,
+                false,
+                ctx,
+            );
+            let grandchild_id = history.start_new_child_conversation(
+                terminal_view_id,
+                "grandchild".to_string(),
+                mid_id,
+                None,
+                false,
+                ctx,
+            );
+            (root_id, mid_id, grandchild_id)
+        });
+
+        // A nested parent whose agent name is empty falls back to the
+        // generic wording instead of rendering "for ".
+        let (unnamed_mid_id, nested_under_unnamed_id) =
+            history_model.update(&mut app, |history, ctx| {
+                let unnamed_mid_id = history.start_new_child_conversation(
+                    terminal_view_id,
+                    String::new(),
+                    root_id,
+                    None,
+                    false,
+                    ctx,
+                );
+                let nested_id = history.start_new_child_conversation(
+                    terminal_view_id,
+                    "nested".to_string(),
+                    unnamed_mid_id,
+                    None,
+                    false,
+                    ctx,
+                );
+                (unnamed_mid_id, nested_id)
+            });
+
+        history_model.read(&app, |history, _| {
+            assert_eq!(agent_view_back_button_label(history, None), "for terminal");
+            assert_eq!(
+                agent_view_back_button_label(history, Some(root_id)),
+                "for terminal",
+            );
+            assert_eq!(
+                agent_view_back_button_label(history, Some(mid_id)),
+                "for Orchestrator",
+            );
+            assert_eq!(
+                agent_view_back_button_label(history, Some(grandchild_id)),
+                "for api-refactor",
+            );
+            assert_eq!(
+                agent_view_back_button_label(history, Some(unnamed_mid_id)),
+                "for Orchestrator",
+            );
+            assert_eq!(
+                agent_view_back_button_label(history, Some(nested_under_unnamed_id)),
+                "for parent agent",
+            );
+        });
+    });
+}
+
+/// A child linked to its parent only via a legacy server conversation token
+/// in `parent_agent_id` (no explicit parent conversation id, no run id) must
+/// still resolve the parent through the history model's canonical
+/// resolution, yielding the same back-button label as an id-linked child.
+#[test]
+fn back_button_label_resolves_token_only_parent_linkage() {
+    App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_history_persistence_for_tests(&mut app);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+        let child_id = history_model.update(&mut app, |history, ctx| {
+            let root_id =
+                history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+            history
+                .set_server_conversation_token_for_conversation(root_id, "root-token".to_string());
+            let child_id =
+                history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+            history
+                .conversation_mut(&child_id)
+                .expect("child conversation exists")
+                .set_parent_agent_id("root-token".to_string());
+            child_id
+        });
+
+        history_model.read(&app, |history, _| {
+            assert_eq!(
+                agent_view_back_button_label(history, Some(child_id)),
+                "for Orchestrator",
+            );
+        });
+    });
+}
+
+#[test]
+fn visible_bootstrap_block_leaves_focus_on_tab_rename_editor() {
+    App::test((), |mut app| async move {
+        initialize_workspace_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let (window, terminal) = workspace.update(&mut app, |workspace, ctx| {
+            workspace.rename_tab(0, ctx);
+            let terminal = workspace
+                .active_tab_pane_group()
+                .as_ref(ctx)
+                .active_session_view(ctx)
+                .expect("tab should contain a terminal");
+            (ctx.window_id(), terminal)
+        });
+        assert!(workspace.read(&app, |workspace, ctx| {
+            workspace.is_inline_rename_editor_focused(ctx)
+        }));
+        let focused_before = app.focused_view_id(window);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_terminal_event(&ModelEvent::VisibleBootstrapBlock, ctx);
+        });
+
+        assert_eq!(app.focused_view_id(window), focused_before);
+        assert!(workspace.read(&app, |workspace, ctx| {
+            workspace.is_inline_rename_editor_focused(ctx)
+        }));
+    });
+}
+
+#[test]
+fn visible_bootstrap_block_leaves_focus_on_tab_group_rename_editor() {
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_workspace_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let (window, terminal, group_id) = workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::SelectNewSessionMenuItem(NewSessionMenuItem::CreateNewTabGroup),
+                ctx,
+            );
+            let group_id = workspace.tabs[0]
+                .group_id
+                .expect("active tab should be assigned to the new group");
+            let terminal = workspace
+                .active_tab_pane_group()
+                .as_ref(ctx)
+                .active_session_view(ctx)
+                .expect("new tab group should contain a terminal");
+            (ctx.window_id(), terminal, group_id)
+        });
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.rename_tab_group(group_id, ctx);
+        });
+        assert!(workspace.read(&app, |workspace, ctx| {
+            workspace.is_inline_rename_editor_focused(ctx)
+        }));
+        let focused_before = app.focused_view_id(window);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_terminal_event(&ModelEvent::VisibleBootstrapBlock, ctx);
+        });
+
+        assert_eq!(app.focused_view_id(window), focused_before);
+        assert!(workspace.read(&app, |workspace, ctx| {
+            workspace.is_inline_rename_editor_focused(ctx)
+        }));
+    });
 }

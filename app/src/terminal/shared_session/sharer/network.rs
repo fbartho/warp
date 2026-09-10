@@ -52,9 +52,10 @@ use crate::server::server_api::ServerApiProvider;
 use crate::server::telemetry::telemetry_context;
 use crate::terminal::TerminalModel;
 use crate::terminal::model::block::BlockId;
+#[cfg(not(any(test, feature = "integration_tests")))]
+use crate::terminal::shared_session::SharedSessionScrollbackType;
 use crate::terminal::shared_session::{
-    EventNumber, SELECTION_THROTTLE_PERIOD, SharedSessionScrollbackType, SharedSessionSource,
-    connect_endpoint, max_session_size,
+    EventNumber, SELECTION_THROTTLE_PERIOD, SharedSessionSource, connect_endpoint,
 };
 use crate::throttle::throttle;
 
@@ -166,6 +167,7 @@ struct StartupConfig {
     universal_developer_input_context: UniversalDeveloperInputContext,
     lifetime: Lifetime,
     selected_model_id: String,
+    share_with_team_uid: Option<crate::server::ids::ServerId>,
 }
 
 #[derive(Debug)]
@@ -252,6 +254,17 @@ impl StartupFailure {
     }
 }
 
+#[cfg(test)]
+fn share_with_team_uid_for_init_payload(
+    scope: &(impl crate::workspaces::user_workspaces::TeamScope + ?Sized),
+) -> Option<String> {
+    use crate::workspaces::user_workspaces::TeamScope;
+
+    crate::workspaces::user_workspaces::ResolvedTeamScope::from_scope(scope)
+        .team_uid()
+        .map(String::from)
+}
+
 #[cfg_attr(any(test, feature = "integration_tests"), allow(dead_code))]
 fn startup_max_attempts(source: &SharedSessionSource) -> usize {
     if matches!(source.source_type, SessionSourceType::AmbientAgent { .. }) {
@@ -311,10 +324,9 @@ impl Network {
     pub fn new_for_test(
         model: Arc<FairMutex<TerminalModel>>,
         ordered_events_rx: Receiver<OrderedTerminalEventType>,
-        _scrollback_type: SharedSessionScrollbackType,
         active_prompt: ActivePrompt,
         selection: Selection,
-        _input_replica_id: ReplicaId,
+        max_session_size: Byte,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
@@ -328,7 +340,7 @@ impl Network {
             model: model.clone(),
             ws_proxy_tx,
             num_bytes_shared: Byte::from_u64(0),
-            max_session_size: max_session_size(ctx),
+            max_session_size,
             pty_bytes_batch_status: PtyBytesBatchStatus::NotBatching {
                 last_sent_at: Instant::now(),
             },
@@ -384,15 +396,16 @@ impl Network {
         selection: Selection,
         input_replica_id: ReplicaId,
         terminal_view_id: warpui::EntityId,
+        team_uid: Option<crate::server::ids::ServerId>,
         universal_developer_input_context: UniversalDeveloperInputContext,
         lifetime: Lifetime,
         source: SharedSessionSource,
+        max_session_size: Byte,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
         let scrollback = scrollback_type.to_scrollback(&model.lock());
         let num_bytes_scrollback = scrollback.num_bytes();
-        let max_session_size = max_session_size(ctx);
         let (selection_throttled_tx, selection_rx) = async_channel::unbounded();
         let selection_throttled_rx = throttle(SELECTION_THROTTLE_PERIOD, selection_rx);
         let init_block_id = model.lock().block_list().active_block_id().clone();
@@ -404,7 +417,7 @@ impl Network {
             }
         };
         let selected_model_id: String = crate::ai::llms::LLMPreferences::as_ref(ctx)
-            .get_active_base_model(ctx, Some(terminal_view_id))
+            .get_active_base_model_for_team_uid(team_uid, ctx, Some(terminal_view_id))
             .id
             .clone()
             .into();
@@ -417,6 +430,7 @@ impl Network {
             universal_developer_input_context: universal_developer_input_context.clone(),
             lifetime,
             selected_model_id,
+            share_with_team_uid: team_uid,
         };
 
         let mut network = Network {
@@ -862,6 +876,7 @@ impl Network {
                             supports_full_role: true,
                             supports_full_role_for_real: true,
                         },
+                        share_with_team_uid: config.share_with_team_uid.map(String::from),
                     });
                     if let Err(e) = network.ws_proxy_tx.try_send(message) {
                         sharer_error!(network, "Sharer failed to send initialization message: {e}");

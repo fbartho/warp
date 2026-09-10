@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt::Display;
 
 use ai::agent::orchestration_config::{OrchestrationConfig, OrchestrationConfigStatus};
 use ai::document::AIDocumentId;
@@ -7,8 +6,6 @@ use ai::skills::SkillPathOrigin;
 use anyhow::Context as _;
 use chrono::{DateTime, Local, TimeZone};
 use itertools::Itertools as _;
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use vec1::{Size0Error, Vec1};
 use warp_cli::agent::Harness;
 use warp_core::command::ExitCode;
@@ -66,8 +63,8 @@ use crate::code_review::CodeReviewTelemetryEvent;
 use crate::notebooks::NotebookId;
 use crate::persistence::ModelEvent;
 use crate::persistence::model::{
-    AgentConversationData, ContextWindowSegment, ConversationUsageMetadata, ModelTokenUsage,
-    PersistedAutoexecuteMode, ToolUsageMetadata,
+    AgentConversationData, ChargedUsageTotals, ContextWindowSegment, ConversationUsageMetadata,
+    ModelTokenUsage, PersistedAutoexecuteMode, ToolUsageMetadata,
 };
 use crate::server::ids::ServerId;
 use crate::terminal::general_settings::GeneralSettings;
@@ -77,6 +74,28 @@ use crate::terminal::model::block::{
 use crate::ui_components::icons::Icon;
 use crate::workspaces::user_profiles::UserProfileWithUID;
 use crate::{BlocklistAIHistoryModel, GlobalResourceHandlesProvider};
+
+/// How a conversation's status should synchronize to the server `ai_tasks` row via
+/// `LocalAgentTaskSyncModel` (REMOTE-2661).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskSyncMode {
+    /// Ordinary conversation: its status drives the task's state and status message.
+    #[default]
+    Normal,
+    /// A debug conversation bootstrapped into a retained setup-failure session. Its
+    /// conversation ID is still reported, but its status must never construct a new task
+    /// status message — the original failure record is preserved. Defense in depth: the
+    /// server independently guards this by comparing the active execution ID.
+    PreserveTerminalSetupFailure,
+}
+
+impl TaskSyncMode {
+    /// Whether conversation status updates should be suppressed from constructing a new task
+    /// state or status message for this conversation.
+    pub fn suppresses_task_lifecycle_updates(self) -> bool {
+        matches!(self, TaskSyncMode::PreserveTerminalSetupFailure)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TodoStatus {
@@ -105,6 +124,13 @@ pub enum RecordingSpanStatus {
     Captured,
 }
 
+/// The wire counters are `uint64` while the persisted and displayed usage rows
+/// are `u32`, so an oversized count saturates instead of wrapping to a small
+/// number that would read as a plausible total.
+fn narrow_token_count(tokens: u64) -> u32 {
+    u32::try_from(tokens).unwrap_or(u32::MAX)
+}
+
 fn footer_model_token_usage(
     usage_metadata: &stream_finished::ConversationUsageMetadata,
     llm_preferences: &LLMPreferences,
@@ -123,12 +149,15 @@ fn footer_model_token_usage(
                 model_id: model_id.clone(),
                 ..Default::default()
             });
-        entry.warp_tokens += usage.total_tokens;
+        entry.warp_tokens = entry
+            .warp_tokens
+            .saturating_add(narrow_token_count(usage.total_tokens));
         for (category, tokens) in &usage.token_usage_by_category {
-            *entry
+            let category_tokens = entry
                 .warp_token_usage_by_category
                 .entry(category.clone())
-                .or_default() += *tokens;
+                .or_default();
+            *category_tokens = category_tokens.saturating_add(narrow_token_count(*tokens));
         }
     }
     for (model_id, usage) in &usage_metadata.byok_token_usage {
@@ -138,12 +167,15 @@ fn footer_model_token_usage(
                 model_id: model_id.clone(),
                 ..Default::default()
             });
-        entry.byok_tokens += usage.total_tokens;
+        entry.byok_tokens = entry
+            .byok_tokens
+            .saturating_add(narrow_token_count(usage.total_tokens));
         for (category, tokens) in &usage.token_usage_by_category {
-            *entry
+            let category_tokens = entry
                 .byok_token_usage_by_category
                 .entry(category.clone())
-                .or_default() += *tokens;
+                .or_default();
+            *category_tokens = category_tokens.saturating_add(narrow_token_count(*tokens));
         }
     }
 
@@ -156,12 +188,15 @@ fn footer_model_token_usage(
                 model_id: label,
                 ..Default::default()
             });
-        entry.custom_endpoint_tokens += usage.total_tokens;
+        entry.custom_endpoint_tokens = entry
+            .custom_endpoint_tokens
+            .saturating_add(narrow_token_count(usage.total_tokens));
         for (category, tokens) in &usage.token_usage_by_category {
-            *entry
+            let category_tokens = entry
                 .custom_endpoint_token_usage_by_category
                 .entry(category.clone())
-                .or_default() += *tokens;
+                .or_default();
+            *category_tokens = category_tokens.saturating_add(narrow_token_count(*tokens));
         }
     }
 
@@ -183,11 +218,49 @@ pub struct ConversationUsageTotals {
     /// shows as "Credits spent (total)" and the conversation details panel
     /// shows as "Credits used".
     pub credits_spent: f32,
-    /// Total provider cost across all models, in US cents. Fractional —
-    /// per-request provider costs are routinely sub-cent — and `f32` to match
-    /// both the upstream `TokenUsage.cost_in_cents` proto float it sums and
-    /// `credits_spent` above.
-    pub cost_in_cents: f32,
+    /// Total provider cost across all models, in US cents. `None` means the
+    /// server did not provide a historical baseline; it must not be rendered
+    /// as `$0.00` or as an incremental-only total.
+    pub cost_in_cents: Option<f32>,
+    /// Whether the conversation has reported any usage. Derived from the
+    /// contents of the usage metadata (not its mere presence), so a restored
+    /// conversation that never ran a request keeps the footer entry hidden,
+    /// while a restored legacy conversation with real usage but an unknown
+    /// historical cost still shows it.
+    pub has_usage: bool,
+    /// Cumulative per-category charged-usage breakdown (input/output/
+    /// cache-read/cache-write cost + token counts) for the whole
+    /// conversation so far, from `ConversationUsageMetadata.total_charges`.
+    /// `None` when the server didn't provide it (flag off, or a legacy
+    /// conversation).
+    pub charged_usage: Option<ChargedUsageTotals>,
+}
+
+impl ConversationUsageTotals {
+    /// Returns the summed total of the tracked usage
+    /// if not available, falls back to the legacy provider total
+    pub fn total_cost_in_cents(&self) -> Option<f32> {
+        self.charged_usage
+            .map(|usage| usage.total_cost_in_cents())
+            .or(self.cost_in_cents)
+    }
+}
+
+/// Whether persisted or server usage metadata carries evidence that the
+/// conversation actually incurred usage. Metadata presence alone is not
+/// enough: the local persistence path always writes a (possibly all-default)
+/// metadata blob, and a restored conversation that never ran a request must
+/// keep the footer's usage entry hidden.
+fn usage_metadata_indicates_usage(metadata: &ConversationUsageMetadata) -> bool {
+    // A present provider cost counts even at 0.0: the server only records a
+    // cost once a turn has completed accounting, so `Some(0.0)` is a known
+    // zero baseline (rendered as $0.00), unlike `None` (unknown).
+    metadata.credits_spent != 0.0
+        || metadata.platform_credits_spent != 0.0
+        || metadata.total_provider_cost_in_cents.is_some()
+        || !metadata.token_usage.is_empty()
+        || metadata.context_window_usage != 0.0
+        || metadata.was_summarized
 }
 
 // basic info for creating a dummy command block based on an exchange's inputs
@@ -315,6 +388,14 @@ pub struct AIConversation {
 
     total_request_cost: RequestCost,
     total_token_usage_by_model: HashMap<String, TokenUsage>,
+    /// Server-authoritative cumulative provider cost in US cents. New
+    /// conversations start at a known zero; restored legacy conversations can
+    /// remain `None` until a server snapshot is available.
+    total_provider_cost_in_cents: Option<f32>,
+    /// True once hydrated usage metadata shows evidence of usage (see
+    /// [`usage_metadata_indicates_usage`]) or a live response reports usage
+    /// (even when its numeric totals are zero).
+    has_usage_metadata: bool,
 
     /// Fallback title used when no task description or initial query exists.
     fallback_display_title: Option<String>,
@@ -357,9 +438,14 @@ pub struct AIConversation {
     /// Keyed by `plan_id`; snapshots with empty `plan_id` are ignored.
     orchestration_configs: HashMap<String, (OrchestrationConfig, OrchestrationConfigStatus)>,
 
-    /// Whether the user has pinned this child agent in the orchestration
-    /// pill bar. Persisted via `AgentConversationData.pinned`.
+    /// Whether the user has pinned this child agent in the
+    /// orchestration pill bar. Persisted via `AgentConversationData.pinned`.
     pinned: bool,
+
+    /// How this conversation's status synchronizes to the server task row. Not persisted: it
+    /// only matters for the live process that bootstrapped the conversation, and a restored
+    /// conversation resumes ordinary synchronization.
+    task_sync_mode: TaskSyncMode,
 }
 
 pub(crate) fn artifact_from_fork_proto(
@@ -404,6 +490,8 @@ impl AIConversation {
             dismissed_suggestion_ids: Default::default(),
             total_request_cost: RequestCost::new(0.),
             total_token_usage_by_model: Default::default(),
+            total_provider_cost_in_cents: Some(0.),
+            has_usage_metadata: false,
             fallback_display_title: None,
             artifacts: Vec::new(),
             parent_agent_id: None,
@@ -414,6 +502,7 @@ impl AIConversation {
             last_event_sequence: None,
             orchestration_configs: HashMap::new(),
             pinned: false,
+            task_sync_mode: TaskSyncMode::default(),
         }
     }
 
@@ -477,7 +566,7 @@ impl AIConversation {
                 })
                 .collect();
 
-            let mut tasks_by_id = HashMap::new();
+            let mut tasks_by_id = hashbrown::HashMap::new();
             // Defer root selection until we've seen every parentless task so
             // we can deterministically prefer a candidate with non-empty
             // messages. Heals legacy DB rows that contain an orphan
@@ -537,6 +626,7 @@ impl AIConversation {
         let (
             server_conversation_token,
             forked_from_server_conversation_token,
+            has_usage_metadata,
             conversation_usage_metadata,
             reverted_action_ids,
             artifacts,
@@ -553,6 +643,10 @@ impl AIConversation {
             let server_conversation_token = data
                 .server_conversation_token
                 .map(ServerConversationToken::new);
+            let has_usage_metadata = data
+                .conversation_usage_metadata
+                .as_ref()
+                .is_some_and(usage_metadata_indicates_usage);
             let conversation_usage_metadata = data.conversation_usage_metadata.unwrap_or_default();
             let reverted_action_ids: HashSet<AIAgentActionId> = data
                 .reverted_action_ids
@@ -588,6 +682,7 @@ impl AIConversation {
             (
                 server_conversation_token,
                 forked_from_server_conversation_token,
+                has_usage_metadata,
                 conversation_usage_metadata,
                 reverted_action_ids,
                 artifacts,
@@ -605,6 +700,7 @@ impl AIConversation {
             (
                 None,
                 None,
+                false,
                 ConversationUsageMetadata::default(),
                 HashSet::new(),
                 Vec::new(),
@@ -619,6 +715,7 @@ impl AIConversation {
                 false,
             )
         };
+        let total_provider_cost_in_cents = conversation_usage_metadata.total_provider_cost_in_cents;
 
         Ok(Self {
             id,
@@ -645,6 +742,8 @@ impl AIConversation {
             dismissed_suggestion_ids: Default::default(),
             total_request_cost: RequestCost::new(0.),
             total_token_usage_by_model: Default::default(),
+            total_provider_cost_in_cents,
+            has_usage_metadata,
             optimistic_cli_subagent_subtask_id: None,
             fallback_display_title: None,
             artifacts,
@@ -656,6 +755,7 @@ impl AIConversation {
             last_event_sequence,
             orchestration_configs: HashMap::new(),
             pinned,
+            task_sync_mode: TaskSyncMode::default(),
         })
     }
 
@@ -738,14 +838,43 @@ impl AIConversation {
         self.conversation_usage_metadata.platform_credits_spent
     }
 
-    /// Test-only helper that sets the conversation's credit total directly.
-    /// Used by unit tests that exercise downstream credit-aware logic
-    /// (e.g. the orchestration credit rollup) without having to wire up a
-    /// full `StreamFinished` event.
+    /// Test-only helper that sets the conversation's credit total directly,
+    /// without wiring up a full `StreamFinished` event.
     #[cfg(test)]
     pub(crate) fn set_credits_spent_for_test(&mut self, credits: f32) {
         self.conversation_usage_metadata.credits_spent = credits;
         self.conversation_usage_metadata.platform_credits_spent = 0.0;
+    }
+
+    /// Test-only helper that sets (or clears) the conversation's dollar-cost
+    /// baseline directly, mirroring what `set_server_metadata` would derive
+    /// from a real snapshot, without wiring up a full snapshot.
+    #[cfg(test)]
+    pub(crate) fn set_cost_in_cents_for_test(&mut self, cost_in_cents: Option<f32>) {
+        self.total_provider_cost_in_cents = cost_in_cents;
+        self.conversation_usage_metadata
+            .total_provider_cost_in_cents = cost_in_cents;
+    }
+
+    /// Test-only helper that sets (or clears) the conversation's cumulative
+    /// charged-usage breakdown directly, mirroring what a real
+    /// `ConversationUsageMetadata.total_charges` update would populate,
+    /// without wiring up a full `StreamFinished` event.
+    #[cfg(test)]
+    pub(crate) fn set_charged_usage_for_test(&mut self, charged_usage: Option<ChargedUsageTotals>) {
+        self.conversation_usage_metadata.total_charged_usage = charged_usage;
+    }
+
+    /// Test-only helper that sets (or clears) the conversation's last-block
+    /// charged-usage breakdown directly, mirroring what a real
+    /// `StreamFinished.request_charges` update would populate.
+    #[cfg(test)]
+    pub(crate) fn set_charged_usage_for_last_block_for_test(
+        &mut self,
+        charged_usage: Option<ChargedUsageTotals>,
+    ) {
+        self.conversation_usage_metadata
+            .charged_usage_for_last_block = charged_usage;
     }
 
     /// Test-only helper that simulates the root-task upgrade performed by the
@@ -779,6 +908,18 @@ impl AIConversation {
         self.conversation_usage_metadata
             .credits_spent_for_last_block
             .map(|credits| (credits * 10.0).round() / 10.0)
+    }
+
+    /// Per-category charged-usage breakdown over the last block, where the
+    /// block comprises all agent outputs since the most recent user input
+    /// (mirrors [`Self::credits_spent_for_last_block`], but as a full
+    /// input/output/cache-read/cache-write cost + token breakdown rather
+    /// than a bare credits figure). `None` when the server didn't provide
+    /// `StreamFinished.request_charges` (flag off) or before any block has
+    /// completed.
+    pub fn charged_usage_for_last_block(&self) -> Option<ChargedUsageTotals> {
+        self.conversation_usage_metadata
+            .charged_usage_for_last_block
     }
 
     /// Time to first token for the last completed set of agent responses
@@ -1022,6 +1163,10 @@ impl AIConversation {
     pub fn server_conversation_token(&self) -> Option<&ServerConversationToken> {
         self.server_conversation_token.as_ref()
     }
+    pub fn debugging_server_conversation_token(&self) -> Option<&ServerConversationToken> {
+        self.server_conversation_token()
+            .or_else(|| self.forked_from_server_conversation_token())
+    }
 
     /// Returns the server-assigned run identifier as a string.
     pub fn run_id(&self) -> Option<String> {
@@ -1081,6 +1226,24 @@ impl AIConversation {
     }
 
     pub fn set_server_metadata(&mut self, metadata: ServerAIConversationMetadata) {
+        // An absent field (legacy server or conversation) must not erase a
+        // known baseline. Asynchronous metadata snapshots can also be stale
+        // relative to live per-request cost accounting, so a snapshot may
+        // only seed or advance the displayed total — never regress it or
+        // re-add costs the client already counted.
+        if let Some(total_provider_cost_in_cents) = metadata.usage.total_provider_cost_in_cents
+            && self
+                .total_provider_cost_in_cents
+                .is_none_or(|current| total_provider_cost_in_cents >= current)
+        {
+            self.total_provider_cost_in_cents = Some(total_provider_cost_in_cents);
+            self.conversation_usage_metadata
+                .total_provider_cost_in_cents = Some(total_provider_cost_in_cents);
+        }
+        // Usage evidence is derived from the metadata's contents (not its
+        // presence) so a zero-usage conversation keeps the footer entry
+        // hidden.
+        self.has_usage_metadata |= usage_metadata_indicates_usage(&metadata.usage);
         self.server_metadata = Some(metadata);
     }
 
@@ -1172,6 +1335,17 @@ impl AIConversation {
     /// Marks this conversation as a remote child placeholder.
     pub fn mark_as_remote_child(&mut self) {
         self.is_remote_child = true;
+    }
+
+    /// Returns how this conversation's status synchronizes to the server task row.
+    pub fn task_sync_mode(&self) -> TaskSyncMode {
+        self.task_sync_mode
+    }
+
+    /// Sets how this conversation's status synchronizes to the server task row. Called once,
+    /// right after creating a debug-turn bootstrap conversation with no prior token.
+    pub fn set_task_sync_mode(&mut self, mode: TaskSyncMode) {
+        self.task_sync_mode = mode;
     }
 
     /// Returns the orchestration config and status for a specific plan,
@@ -1829,7 +2003,7 @@ impl AIConversation {
                             buffered_action_ids.push(action.id.clone());
                         }
                     }
-                    AIAgentActionType::StopRecording { recording_id } => {
+                    AIAgentActionType::StopRecording { recording_id, .. } => {
                         let Some(span) = active_span.as_ref() else {
                             continue;
                         };
@@ -1852,7 +2026,9 @@ impl AIConversation {
                                 active_span = None;
                             }
                             Some(AIAgentActionResultType::StopRecording(
-                                StopRecordingResult::Error(_) | StopRecordingResult::Cancelled,
+                                StopRecordingResult::Error(_)
+                                | StopRecordingResult::Cancelled
+                                | StopRecordingResult::Discarded,
                             )) => {
                                 // The stop saved no recording, so the buffered
                                 // rows must not be labeled as captured.
@@ -2132,12 +2308,18 @@ impl AIConversation {
     pub fn update_cost_and_usage_for_request(
         &mut self,
         request_cost: Option<RequestCost>,
+        request_charges: Option<stream_finished::RequestCharges>,
         token_usage: Vec<TokenUsage>,
         usage_metadata: Option<stream_finished::ConversationUsageMetadata>,
         was_user_initiated_request: bool,
         ctx: &AppContext,
     ) -> Result<(), UpdateConversationError> {
+        self.has_usage_metadata |=
+            request_cost.is_some() || usage_metadata.is_some() || !token_usage.is_empty();
         for usage in token_usage.into_iter() {
+            if let Some(total_provider_cost_in_cents) = self.total_provider_cost_in_cents.as_mut() {
+                *total_provider_cost_in_cents += usage.cost_in_cents;
+            }
             let entry = self
                 .total_token_usage_by_model
                 .entry(usage.model_id.clone())
@@ -2174,12 +2356,39 @@ impl AIConversation {
             self.total_request_cost += request_cost;
         }
 
+        // Mirrors the `credits_spent_for_last_block` reset above: a
+        // user-initiated request starts a new response block. Reset
+        // unconditionally (not only inside the `Some(request_charges)`
+        // branch below) so a later request in the same turn that happens
+        // to carry no charges (e.g. the flag is off for it) doesn't leave
+        // the previous block's stale totals in place, which would pair a
+        // fresh credits figure with stale token/cost details.
+        if was_user_initiated_request {
+            self.conversation_usage_metadata
+                .charged_usage_for_last_block = None;
+        }
+        if let Some(request_charges) = request_charges {
+            let totals = ChargedUsageTotals::from(&request_charges);
+            let charged_usage_for_last_block = self
+                .conversation_usage_metadata
+                .charged_usage_for_last_block
+                .get_or_insert_with(ChargedUsageTotals::default);
+            *charged_usage_for_last_block += totals;
+        }
+
         if let Some(usage_metadata) = usage_metadata {
             self.conversation_usage_metadata.context_window_usage =
                 usage_metadata.context_window_usage;
             self.conversation_usage_metadata.credits_spent = usage_metadata.credits_spent;
-            self.conversation_usage_metadata.platform_credits_spent =
-                usage_metadata.platform_credits_spent;
+            #[allow(deprecated)]
+            {
+                self.conversation_usage_metadata.platform_credits_spent =
+                    usage_metadata.platform_credits_spent;
+            }
+            self.conversation_usage_metadata.total_charged_usage = usage_metadata
+                .total_charges
+                .as_ref()
+                .map(ChargedUsageTotals::from);
             let llm_preferences = LLMPreferences::as_ref(ctx);
             self.conversation_usage_metadata.token_usage =
                 footer_model_token_usage(&usage_metadata, llm_preferences);
@@ -2202,6 +2411,8 @@ impl AIConversation {
                 self.conversation_usage_metadata.was_summarized = usage_metadata.summarized;
             }
         }
+        self.conversation_usage_metadata
+            .total_provider_cost_in_cents = self.total_provider_cost_in_cents;
         Ok(())
     }
 
@@ -2937,6 +3148,15 @@ impl AIConversation {
                                     &task_id,
                                     &self.task_store,
                                 );
+                                // A computer-use subagent finishing normally ends its background
+                                // session; restore the user's keyboard focus so it no longer
+                                // targets the driven window. Scoped to this conversation so a
+                                // concurrent background session in another conversation is left
+                                // intact. Idempotent and a no-op when this conversation has no
+                                // active background session (e.g. other subagent types). The
+                                // ctrl-c / cancel path, where no SubagentResult is produced, is
+                                // handled in `BlocklistAIController::cancel_conversation_progress`.
+                                computer_use::end_background_session(&self.id.to_string());
                             }
                         }
                         Some(api::message::Message::ModelUsed(model_used)) => {
@@ -3093,15 +3313,19 @@ impl AIConversation {
                 }
 
                 let task_id = TaskId::new(task_id);
-                let exchange_id = self
+                // Updates may target messages from exchanges added by earlier response
+                // streams (e.g. the server swapping computer-use screenshot bytes for a
+                // stored ref), so the current stream is not required to have added an
+                // exchange for this task. `Task::upsert_message` resolves the exchange
+                // that owns the message and only needs this one for new messages.
+                let current_stream_exchange_id = self
                     .added_exchanges_by_response
                     .get(response_stream_id)
                     .ok_or(UpdateConversationError::NoPendingRequest)?
                     .iter()
                     .find_map(|new_exchange| {
                         (new_exchange.task_id == task_id).then_some(new_exchange.exchange_id)
-                    })
-                    .ok_or(UpdateConversationError::ExchangeNotFound)?;
+                    });
 
                 let current_todo_list = self.todo_lists.last().cloned();
                 let current_comment_state = self.code_review.as_ref().cloned();
@@ -3111,12 +3335,12 @@ impl AIConversation {
                 // sent on this client). Once we reconstruct these inputs, we will insert them
                 // to mimic the normal conversation flow. (If this is not a shared session, the
                 // exchange inputs will already be populated).
-                let todos_op = self
+                let (exchange_id, todos_op) = self
                     .task_store
                     .modify_task(&task_id, |task| {
                         task.upsert_message(
                             message,
-                            exchange_id,
+                            current_stream_exchange_id,
                             TaskMessageContext {
                                 current_todo_list: current_todo_list.as_ref(),
                                 active_code_review: current_comment_state.as_ref(),
@@ -3125,7 +3349,7 @@ impl AIConversation {
                             mask,
                             is_viewing_shared_session,
                         )
-                        .map(|msg| msg.todos_op().cloned())
+                        .map(|(exchange_id, msg)| (exchange_id, msg.todos_op().cloned()))
                     })
                     .ok_or(UpdateConversationError::TaskNotFound)??;
                 // Update todo list if needed
@@ -3401,8 +3625,8 @@ impl AIConversation {
 
     /// Replaces the conversation's todo lists directly, bypassing the normal
     /// todo-operation replay, for projection tests.
-    #[cfg(test)]
-    pub(crate) fn set_todo_lists_for_test(&mut self, todo_lists: Vec<AIAgentTodoList>) {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_todo_lists_for_test(&mut self, todo_lists: Vec<AIAgentTodoList>) {
         self.todo_lists = todo_lists;
     }
 
@@ -3466,8 +3690,16 @@ impl AIConversation {
         &mut self,
         ctx: &mut ModelContext<BlocklistAIHistoryModel>,
     ) {
-        // We should not persist non-local conversations (e.g. shared sessions).
-        if self.is_viewing_shared_session {
+        // Don't persist viewer conversations (e.g. shared sessions).
+        // Under the unified stack, remote child placeholder conversations are
+        // also not persisted — they are rediscovered on restore via the
+        // ancestor-list seed, so a persisted row would only risk going stale.
+        // Under the flag-off path, remote children must be persisted so they
+        // survive restarts.
+        if self.is_viewing_shared_session
+            || (self.is_remote_child
+                && crate::features::FeatureFlag::OrchestrationUnifiedStack.is_enabled())
+        {
             return;
         }
 
@@ -3512,12 +3744,13 @@ impl AIConversation {
             }
         };
 
+        let updated_tasks: Vec<_> = self
+            .all_tasks()
+            .filter_map(|task| task.source_for_persistence())
+            .collect();
         let event = ModelEvent::UpdateMultiAgentConversation {
             conversation_id: self.id.to_string(),
-            updated_tasks: self
-                .all_tasks()
-                .filter_map(|task| task.source_for_persistence())
-                .collect(),
+            updated_tasks,
             conversation_data: AgentConversationData {
                 server_conversation_token: self
                     .server_conversation_token
@@ -3669,17 +3902,15 @@ impl AIConversation {
     }
 
     /// Compact usage totals for lightweight displays (e.g. the TUI footer's
-    /// usage entry): the GUI-consistent credits total plus the accumulated
-    /// provider dollar cost from the per-request `StreamFinished` usage rows.
+    /// usage entry): the GUI-consistent credits total plus the server-seeded
+    /// provider cost and any permitted live per-request deltas.
     pub fn usage_totals(&self) -> ConversationUsageTotals {
-        let mut totals = ConversationUsageTotals {
+        ConversationUsageTotals {
             credits_spent: self.inference_credits_spent() + self.platform_credits_spent(),
-            cost_in_cents: 0.0,
-        };
-        for usage in self.total_token_usage_by_model.values() {
-            totals.cost_in_cents += usage.cost_in_cents;
+            cost_in_cents: self.total_provider_cost_in_cents,
+            has_usage: self.has_usage_metadata,
+            charged_usage: self.conversation_usage_metadata.total_charged_usage,
         }
-        totals
     }
 
     /// Normalize all newlines to CRLF so restored blocks render lines starting at column 0,
@@ -4391,35 +4622,7 @@ pub enum UpdateConversationError {
     NoPendingRequest,
 }
 
-/// A globally unique ID for a conversation with an AI agent.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AIConversationId(Uuid);
-
-impl Display for AIConversationId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl AIConversationId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for AIConversationId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TryFrom<String> for AIConversationId {
-    type Error = anyhow::Error;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Ok(Self(Uuid::try_parse(&value)?))
-    }
-}
+pub use ai_types::AIConversationId;
 
 /// The harness that produced an agent conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

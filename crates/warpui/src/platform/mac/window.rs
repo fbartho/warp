@@ -148,10 +148,6 @@ impl platform::WindowManager for WindowManager {
         Window::set_all_windows_background_blur_radius(blur_radius_pixels)
     }
 
-    fn set_all_windows_background_blur_texture(&self, _use_blur_texture: bool) {
-        // no-op on MacOS. This is only available on Windows.
-    }
-
     fn set_window_title(&self, window_id: WindowId, title: &str) {
         Window::set_window_title(window_id, title)
     }
@@ -335,10 +331,6 @@ impl platform::WindowManager for IntegrationTestWindowManager {
         // no-op for tests
     }
 
-    fn set_all_windows_background_blur_texture(&self, _use_blur_texture: bool) {
-        // no-op for tests
-    }
-
     fn set_window_title(&self, window_id: WindowId, title: &str) {
         self.window_manager.set_window_title(window_id, title)
     }
@@ -473,7 +465,7 @@ unsafe extern "C" {
         default_filename: &NSString,
         default_directory: &NSString,
     );
-    fn open_url(urlString: &NSString);
+    fn open_url(urlString: &NSString) -> Bool;
     fn set_titlebar_height(window: &NSWindow, height: f64);
 }
 
@@ -742,11 +734,9 @@ impl Window {
         }
     }
 
-    pub fn open_url(url: &str) {
+    pub fn open_url(url: &str) -> bool {
         // SAFETY: `open_url` reads the string for the duration of the call.
-        unsafe {
-            open_url(&NSString::from_str(url));
-        }
+        unsafe { open_url(&NSString::from_str(url)).as_bool() }
     }
 
     pub fn open_file_path(path: &Path) {

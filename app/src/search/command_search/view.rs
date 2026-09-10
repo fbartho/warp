@@ -29,7 +29,6 @@ use warpui::{
 use super::ai_queries::AIQueriesDataSource;
 use super::env_var_collections::EnvVarCollectionDataSource;
 use super::history::history_data_source_for_session;
-use super::notebooks::notebooks_data_source;
 use super::warp_ai::WarpAIDataSource;
 use super::workflows::{WorkflowsDataSource, cloud_workflows_data_source};
 use super::zero_state::{CommandSearchZeroStateEvent, CommandSearchZeroStateView};
@@ -223,6 +222,7 @@ impl CommandSearchView {
         ai_execution_context: Option<WarpAiExecutionContext>,
         ctx: &mut ViewContext<Self>,
     ) {
+        let window_id = ctx.window_id();
         self.mixer.update(ctx, |mixer, ctx| {
             mixer.reset(ctx);
 
@@ -258,19 +258,8 @@ impl CommandSearchView {
                 }
 
                 mixer.add_async_source(
-                    cloud_workflows_data_source(),
+                    cloud_workflows_data_source(window_id),
                     workflows_filters,
-                    AddAsyncSourceOptions {
-                        debounce_interval: Some(Duration::from_millis(50)),
-                        run_in_zero_state: true,
-                        run_when_unfiltered: true,
-                    },
-                    ctx,
-                );
-
-                mixer.add_async_source(
-                    notebooks_data_source(),
-                    HashSet::from([QueryFilter::Notebooks]),
                     AddAsyncSourceOptions {
                         debounce_interval: Some(Duration::from_millis(50)),
                         run_in_zero_state: true,
@@ -298,9 +287,7 @@ impl CommandSearchView {
             }
 
             if History::as_ref(ctx).is_queryable(&session_id) {
-                let source = History::handle(ctx).read(ctx, |history_model, app| {
-                    history_data_source_for_session(session_id, history_model, app)
-                });
+                let source = history_data_source_for_session(session_id);
                 mixer.add_async_source(
                     source,
                     HashSet::from([QueryFilter::History]),
@@ -317,11 +304,7 @@ impl CommandSearchView {
                     move |mixer, _, history_event, ctx| match history_event {
                         HistoryEvent::Initialized(id) => {
                             if id == &session_id {
-                                let source = history_data_source_for_session(
-                                    session_id,
-                                    History::as_ref(ctx),
-                                    ctx,
-                                );
+                                let source = history_data_source_for_session(session_id);
                                 mixer.add_async_source(
                                     source,
                                     HashSet::from([QueryFilter::History]),
@@ -494,7 +477,6 @@ impl CommandSearchView {
 
                 AcceptHistory(_)
                 | AcceptWorkflow(_)
-                | AcceptNotebook(_)
                 | OpenWarpAI
                 | AcceptEnvVarCollection(_)
                 | TranslateUsingWarpAI
@@ -592,7 +574,8 @@ impl CommandSearchView {
     ) -> Box<dyn Element> {
         if is_ratelimit_error {
             let current_user_id = self.auth_state.user_id().unwrap_or_default();
-            if let Some(team) = UserWorkspaces::as_ref(app).current_team() {
+            if let Some(team) = UserWorkspaces::as_ref(app).team_for_view_handle(&self.handle, app)
+            {
                 let current_user_email = self.auth_state.user_email().unwrap_or_default();
                 let has_admin_permissions = team.has_admin_permissions(&current_user_email);
                 if team.billing_metadata.can_upgrade_to_higher_tier_plan() {

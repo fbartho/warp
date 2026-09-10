@@ -332,6 +332,7 @@ fn convert_input_to_user_input(
                             command_id: block_id.as_str().to_owned(),
                             is_alt_screen_active,
                             is_preempted: false,
+                            activity: None,
                         }),
                     }),
                     run_shell_command_tool_call_id: requested_command_id.map(|id| id.to_string()).unwrap_or_default(),
@@ -682,9 +683,6 @@ impl TryFrom<AIAgentActionResult> for api::request::input::user_inputs::user_inp
             }
             AIAgentActionResultType::FetchConversation(fetch_conversation_result) => {
                 Some(fetch_conversation_result.try_into()?)
-            }
-            AIAgentActionResultType::StartAgent(start_agent_result) => {
-                Some(start_agent_result.into())
             }
             AIAgentActionResultType::SendMessageToAgent(send_message_result) => {
                 Some(send_message_result.into())

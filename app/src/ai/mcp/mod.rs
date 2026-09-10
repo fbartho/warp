@@ -49,6 +49,8 @@ cfg_if::cfg_if! {
 
 pub mod gallery;
 pub use gallery::MCPGalleryManager;
+#[cfg(not(target_family = "wasm"))]
+pub mod builtin;
 pub mod templatable;
 #[cfg(not(target_family = "wasm"))]
 pub use cloud_object_models::{
@@ -112,7 +114,7 @@ impl StringModel for MCPServer {
         QueueItem::UpdateMCPServer {
             model: object.model().clone().into(),
             id: object.id,
-            revision: revision_ts.or_else(|| object.metadata.revision.clone()),
+            revision: revision_ts.or(object.metadata.revision),
         }
     }
 
@@ -490,10 +492,22 @@ pub enum MCPServerUpdate {
     },
 }
 
+/// The home directory that global (non-Warp) provider configs are resolved against. Tests
+/// redirect it through `HOME`; `dirs::home_dir()` ignores that variable on Windows.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
+    }
+    dirs::home_dir()
+}
+
 pub(crate) fn home_config_file_path(provider: MCPProvider) -> Option<PathBuf> {
     match provider {
         MCPProvider::Warp => warp_core::paths::warp_home_mcp_config_file_path(),
-        _ => dirs::home_dir().map(|home_dir| home_dir.join(provider.home_config_path())),
+        _ => home_dir().map(|home_dir| home_dir.join(provider.home_config_path())),
     }
 }
 
@@ -517,10 +531,15 @@ impl MCPProvider {
 
     pub fn icon(&self) -> Icon {
         match self {
-            MCPProvider::Warp => Icon::Warp,
+            // Warp's own agent MCP config — use the Warp agent brand mark.
+            MCPProvider::Warp => Icon::Agent,
             MCPProvider::Claude => Icon::ClaudeLogo,
             MCPProvider::Codex => Icon::OpenAILogo,
-            MCPProvider::Agents => Icon::Warp,
+            // "Other Agents" is the cross-tool .agents/.mcp.json convention for
+            // third-party agent tooling (not Warp-branded). Use a neutral AI
+            // icon so this row never carries the Warp agent mark, and the two
+            // rows remain visually distinct once Icon::Agent gets its own asset.
+            MCPProvider::Agents => Icon::AiAssistant,
         }
     }
 

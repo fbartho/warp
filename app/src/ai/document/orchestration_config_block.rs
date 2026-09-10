@@ -6,7 +6,6 @@ use ai::agent::action::RunAgentsExecutionMode;
 use ai::agent::orchestration_config::OrchestrationConfigStatus;
 use pathfinder_geometry::vector::vec2f;
 use warp_cli::agent::Harness;
-use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
 use warp_graphql::queries::get_runners::RunnerSortBy;
 use warpui::elements::{
@@ -46,9 +45,14 @@ use crate::ai::harness_availability::{
 };
 use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
 use crate::appearance::Appearance;
+use crate::server::experiments::{ServerExperiments, ServerExperimentsEvent};
 use crate::server::server_api::ServerApiProvider;
+use crate::server::team_scope::RequestTeamScope;
 use crate::ui_components::blended_colors;
 use crate::workspace::WorkspaceAction;
+use crate::workspaces::user_workspaces::{
+    TeamContextResolver, UserWorkspaces, UserWorkspacesEvent,
+};
 
 /// True when the mode is remote and `environment_id` is non-empty.
 fn env_presence(execution_mode: &RunAgentsExecutionMode) -> bool {
@@ -161,6 +165,7 @@ pub struct OrchestrationConfigBlockView {
     runners: Vec<(String, String)>,
     /// True while the `getRunners` fetch is in flight.
     runners_loading: bool,
+    team_context_resolver: TeamContextResolver,
 }
 
 impl OrchestrationConfigBlockView {
@@ -209,6 +214,17 @@ impl OrchestrationConfigBlockView {
                 }
             },
         );
+        ctx.subscribe_to_model(&ServerExperiments::handle(ctx), |me, _, event, ctx| {
+            let ServerExperimentsEvent::ExperimentsUpdated = event;
+            if !oc::runner_controls_enabled(ctx) {
+                me.pickers.runner_picker = None;
+                me.runners.clear();
+                me.runners_loading = false;
+            } else {
+                me.ensure_runner_picker(ctx);
+            }
+            ctx.notify();
+        });
 
         // Repopulate the model picker when available LLMs change (Oz
         // harness only — non-Oz harnesses get their catalog from
@@ -238,8 +254,6 @@ impl OrchestrationConfigBlockView {
 
         // Repopulate pickers when the server-provided harness list,
         // harness model catalogs, or per-harness auth secrets change.
-        // Without an `AuthSecretsLoaded` handler the picker stays on
-        // "Loading…" forever after the lazy fetch completes.
         ctx.subscribe_to_model(
             &HarnessAvailabilityModel::handle(ctx),
             |me, _, event, ctx| match event {
@@ -260,13 +274,7 @@ impl OrchestrationConfigBlockView {
                     ctx.notify();
                 }
                 HarnessAvailabilityEvent::Changed
-                | HarnessAvailabilityEvent::AuthSecretsLoaded
-                | HarnessAvailabilityEvent::AuthSecretsFetchFailed
-                | HarnessAvailabilityEvent::AuthSecretDeleted { .. } => {
-                    // Repopulate even on fetch failure to replace "Loading…".
-                    // The Deleted event also triggers a refresh so any
-                    // already-mounted picker drops the deleted entry from
-                    // its menu.
+                | HarnessAvailabilityEvent::AuthSecretsChanged => {
                     if me.pickers_initialized {
                         oc::repopulate_all_pickers(
                             &mut me.orchestration_edit_state.orchestration_config_state,
@@ -278,6 +286,7 @@ impl OrchestrationConfigBlockView {
                     ctx.notify();
                 }
                 HarnessAvailabilityEvent::AuthSecretCreationFailed { .. }
+                | HarnessAvailabilityEvent::AuthSecretDeleted { .. }
                 | HarnessAvailabilityEvent::AuthSecretDeletionFailed { .. } => {}
             },
         );
@@ -307,6 +316,32 @@ impl OrchestrationConfigBlockView {
                 }
             },
         );
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, _, event, ctx| {
+            let affects_this_window = matches!(event, UserWorkspacesEvent::TeamsChanged)
+                || matches!(
+                    event,
+                    UserWorkspacesEvent::WindowTeamChanged { window_id }
+                        if *window_id == ctx.window_id()
+                );
+            if !affects_this_window {
+                return;
+            }
+            me.orchestration_edit_state
+                .orchestration_config_state
+                .auth_secret_selection = AuthSecretSelection::Unset;
+            let scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+            ConnectedSelfHostedWorkersModel::handle(ctx).update(ctx, |model, ctx| {
+                model.refresh(&scope, ctx);
+            });
+            if me.pickers_initialized {
+                oc::repopulate_all_pickers(
+                    &mut me.orchestration_edit_state.orchestration_config_state,
+                    &me.pickers,
+                    ctx,
+                );
+            }
+            ctx.notify();
+        });
         let mut view = Self {
             conversation_id,
             plan_id,
@@ -323,6 +358,7 @@ impl OrchestrationConfigBlockView {
             user_has_interacted: false,
             runners: Vec::new(),
             runners_loading: false,
+            team_context_resolver: UserWorkspaces::team_context_resolver(ctx.handle()),
         };
         if view.is_approved {
             view.ensure_pickers(ctx);
@@ -384,9 +420,10 @@ impl OrchestrationConfigBlockView {
             return;
         };
         // Only auto-open on `Loaded([])`. Other fetch states are
-        // ambiguous; the `AuthSecretsLoaded` subscription will retry.
+        // ambiguous; the `AuthSecretsChanged` subscription will retry.
+        let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
         let has_zero_loaded = matches!(
-            HarnessAvailabilityModel::as_ref(ctx).auth_secrets_for(harness),
+            HarnessAvailabilityModel::as_ref(ctx).auth_secrets_for(&team_scope, harness),
             AuthSecretFetchState::Loaded(secrets) if secrets.is_empty()
         );
         if !has_zero_loaded {
@@ -510,7 +547,8 @@ impl OrchestrationConfigBlockView {
             // over the bare "warp" fallback so self-hosted teams see
             // their default pre-selected. Mirrors the Oz webapp's
             // `HostSelector` initial-selection behavior.
-            let default_host = oc::resolve_default_host_slug(ctx)
+            let scope = UserWorkspaces::as_ref(ctx).team_context_for_view(ctx);
+            let default_host = oc::resolve_default_host_slug(&scope, ctx)
                 .unwrap_or_else(|| oc::ORCHESTRATION_WARP_WORKER_HOST.to_string());
             self.orchestration_edit_state
                 .orchestration_config_state
@@ -548,6 +586,10 @@ impl OrchestrationConfigBlockView {
             RunAgentsExecutionMode::Remote { worker_host, .. } => worker_host.as_str(),
             RunAgentsExecutionMode::Local => oc::ORCHESTRATION_WARP_WORKER_HOST,
         };
+        let scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+        ConnectedSelfHostedWorkersModel::handle(ctx).update(ctx, |model, ctx| {
+            model.refresh(&scope, ctx);
+        });
         let host_handle = ctx.add_typed_action_view(HostPicker::new);
         // Paint the open menu in the overlay layer so it doesn't get covered
         // by sibling pickers, matching the other pickers in this view.
@@ -557,8 +599,9 @@ impl OrchestrationConfigBlockView {
         oc::populate_host_picker(&host_handle, initial_host, ctx);
         ctx.subscribe_to_view(&host_handle, |_me, _, event, ctx| match event {
             HostPickerEvent::Opened => {
+                let scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
                 ConnectedSelfHostedWorkersModel::handle(ctx).update(ctx, |model, ctx| {
-                    model.refresh(ctx);
+                    model.refresh(&scope, ctx);
                 });
             }
             HostPickerEvent::HostChanged { slug } => {
@@ -583,6 +626,7 @@ impl OrchestrationConfigBlockView {
             self.orchestration_edit_state
                 .orchestration_config_state
                 .auth_secret_selection = oc::resolve_auth_secret_selection_for_harness(
+                &scope,
                 &self
                     .orchestration_edit_state
                     .orchestration_config_state
@@ -654,12 +698,13 @@ impl OrchestrationConfigBlockView {
     }
 
     /// Builds the Runner picker and kicks off the `getRunners` fetch, but
-    /// only when the `CloudAgentRunners` feature is enabled and the config
+    /// only when the `CloudAgentRunners` feature is enabled and the macOS
+    /// runner experiment is active, and the config
     /// is in remote mode — otherwise the Runner control is not rendered, so
     /// there is no reason to create the picker or hit `getRunners`.
     /// Idempotent, and re-invoked on the Local→Cloud toggle.
     fn ensure_runner_picker(&mut self, ctx: &mut ViewContext<Self>) {
-        if !FeatureFlag::CloudAgentRunners.is_enabled() {
+        if !oc::runner_controls_enabled(ctx) {
             return;
         }
         if !self
@@ -703,8 +748,15 @@ impl OrchestrationConfigBlockView {
         }
         self.runners_loading = true;
         let client = ServerApiProvider::as_ref(ctx).get_factory_client();
+        let team_scope = RequestTeamScope::from_scope(
+            &UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx),
+        );
         ctx.spawn(
-            async move { client.get_runners(Some(RunnerSortBy::Name)).await },
+            async move {
+                client
+                    .get_runners(Some(RunnerSortBy::Name), Some(team_scope))
+                    .await
+            },
             |me, result, ctx| {
                 me.runners_loading = false;
                 match result {
@@ -886,6 +938,7 @@ impl View for OrchestrationConfigBlockView {
                     &self.pickers,
                     appearance,
                     true,
+                    oc::runner_controls_enabled(app),
                 ));
 
                 // Helper text
@@ -913,7 +966,14 @@ impl View for OrchestrationConfigBlockView {
                         .orchestration_edit_state
                         .orchestration_config_state
                         .execution_mode,
-                    app,
+                    oc::environment_snapshot(
+                        &self.orchestration_edit_state.orchestration_config_state,
+                        &(self.team_context_resolver)(app),
+                        app,
+                    )
+                    .rows
+                    .iter()
+                    .any(|row| !row.id.is_empty()),
                 ) {
                     column.add_child(oc::render_validation_error(
                         message,
@@ -1065,9 +1125,10 @@ impl TypedActionView for OrchestrationConfigBlockView {
             OrchestrationConfigBlockAction::AuthSecretChanged { auth_secret_name } => {
                 // No `apply_field_change`: secrets are user-scoped and
                 // persisted side-channel, not baked into `OrchestrationConfig`.
+                let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
                 self.orchestration_edit_state
                     .orchestration_config_state
-                    .apply_auth_secret_change(auth_secret_name.clone(), ctx);
+                    .apply_auth_secret_change(&team_scope, auth_secret_name.clone(), ctx);
                 ctx.notify();
             }
             OrchestrationConfigBlockAction::CreateNewAuthSecretRequested => {

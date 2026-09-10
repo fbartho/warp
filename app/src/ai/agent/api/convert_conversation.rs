@@ -10,9 +10,8 @@ use std::time::{Duration, SystemTime};
 
 use ai::agent::action_result::{
     AskUserQuestionAnswerItem, AskUserQuestionResult, FetchConversationResult, ReadSkillResult,
-    RecordingStarted, RecordingStopped, RequestComputerUseResult, SendMessageToAgentResult,
-    StartAgentResult, StartAgentVersion, StartRecordingResult, StopRecordingResult,
-    UseComputerResult,
+    RecordingStarted, RecordingStopped, RequestComputerUseResult, ScreenshotSource,
+    SendMessageToAgentResult, StartRecordingResult, StopRecordingResult, UseComputerResult,
 };
 use ai::skills::{ParsedSkill, SkillPathOrigin};
 use chrono::{DateTime, Local, TimeZone};
@@ -606,6 +605,7 @@ pub(crate) fn convert_tool_call_result_to_input(
                     grid_contents: snapshot.output.clone(),
                     cursor: snapshot.cursor.clone(),
                     is_alt_screen_active: snapshot.is_alt_screen_active,
+                    activity: snapshot.activity.as_ref().map(Into::into),
                 },
                 Some(api::run_shell_command_result::Result::PermissionDenied(
                     api::PermissionDenied { .. },
@@ -635,6 +635,7 @@ pub(crate) fn convert_tool_call_result_to_input(
                         cursor: snapshot.cursor.clone(),
                         is_alt_screen_active: snapshot.is_alt_screen_active,
                         is_preempted: snapshot.is_preempted,
+                        activity: snapshot.activity.as_ref().map(Into::into),
                     },
                     Some(api::write_to_long_running_shell_command_result::Result::CommandFinished(
                         finished,
@@ -1277,6 +1278,7 @@ pub(crate) fn convert_tool_call_result_to_input(
                     cursor: snapshot.cursor.clone(),
                     is_alt_screen_active: snapshot.is_alt_screen_active,
                     is_preempted: snapshot.is_preempted,
+                    activity: snapshot.activity.as_ref().map(Into::into),
                 },
                 Some(api::read_shell_command_output_result::Result::Error(
                     api::ShellCommandError {
@@ -1307,6 +1309,7 @@ pub(crate) fn convert_tool_call_result_to_input(
                     cursor: snapshot.cursor.clone(),
                     is_alt_screen_active: snapshot.is_alt_screen_active,
                     is_preempted: snapshot.is_preempted,
+                    activity: snapshot.activity.as_ref().map(Into::into),
                 },
                 Some(
                     api::transfer_shell_command_control_to_user_result::Result::CommandFinished(finished),
@@ -1368,15 +1371,32 @@ pub(crate) fn convert_tool_call_result_to_input(
                 match &result.result {
                     Some(api::use_computer_result::Result::Success(success)) => {
                         let screenshot = success.screenshot.as_ref().map(|s| {
-                            // The original dimensions are not preserved through the API, so we use
-                            // the current dimensions for both.
-                            computer_use::Screenshot {
-                                width: s.width as usize,
-                                height: s.height as usize,
-                                original_width: s.width as usize,
-                                original_height: s.height as usize,
-                                data: s.data.clone(),
-                                mime_type: s.mime_type.clone().into(),
+                            // The original dimensions are not preserved through the API, so
+                            // we use the current dimensions for both.
+                            let inline = |data| {
+                                ScreenshotSource::Inline(computer_use::Screenshot {
+                                    width: s.width as usize,
+                                    height: s.height as usize,
+                                    original_width: s.width as usize,
+                                    original_height: s.height as usize,
+                                    data,
+                                    mime_type: s.mime_type.clone().into(),
+                                })
+                            };
+                            match &s.source {
+                                Some(api::raw_image::Source::Data(data)) => inline(data.clone()),
+                                // A screenshot whose bytes were offloaded to object storage
+                                // arrives with the `StoredRef` source variant; the ref is
+                                // carried for on-demand fetching.
+                                Some(api::raw_image::Source::StoredRef(stored_ref)) => {
+                                    ScreenshotSource::Stored {
+                                        stored_ref: stored_ref.clone(),
+                                        mime_type: s.mime_type.clone(),
+                                        width: s.width,
+                                        height: s.height,
+                                    }
+                                }
+                                None => inline(Vec::new()),
                             }
                         });
                         let cursor_position = success
@@ -1398,12 +1418,12 @@ pub(crate) fn convert_tool_call_result_to_input(
                                 height_px: c.height_px,
                             }
                         });
-                        UseComputerResult::Success(computer_use::ActionResult {
+                        UseComputerResult::Success {
                             screenshot,
                             cursor_position,
                             windows,
                             captured_window,
-                        })
+                        }
                     }
                     Some(api::use_computer_result::Result::Error(error)) => {
                         UseComputerResult::Error(error.message.clone())
@@ -1438,7 +1458,12 @@ pub(crate) fn convert_tool_call_result_to_input(
                                 height: initial_screenshot.height as usize,
                                 original_width: screen_dimensions.width_px as usize,
                                 original_height: screen_dimensions.height_px as usize,
-                                data: initial_screenshot.data.clone(),
+                                // Initial screenshots are never offloaded, so any non-inline
+                                // source defensively converts to an empty image.
+                                data: match &initial_screenshot.source {
+                                    Some(api::raw_image::Source::Data(data)) => data.clone(),
+                                    Some(api::raw_image::Source::StoredRef(_)) | None => Vec::new(),
+                                },
                                 mime_type: initial_screenshot.mime_type.clone().into(),
                             },
                             platform,
@@ -1500,58 +1525,6 @@ pub(crate) fn convert_tool_call_result_to_input(
             create_cancelled_result_for_tool_call(task_id, &tool_call_id, tool_call_map, context)
         }
         Some(ToolCallResultType::Subagent(_)) => None,
-        Some(ToolCallResultType::StartAgent(result)) => {
-            let start_agent_result = match &result.result {
-                Some(api::start_agent_result::Result::Success(success)) => {
-                    StartAgentResult::Success {
-                        agent_id: success.agent_id.clone(),
-                        version: StartAgentVersion::V1,
-                    }
-                }
-                Some(api::start_agent_result::Result::Error(error)) => StartAgentResult::Error {
-                    error: error.error.clone(),
-                    version: StartAgentVersion::V1,
-                },
-                None => StartAgentResult::Cancelled {
-                    version: StartAgentVersion::V1,
-                },
-            };
-
-            Some(AIAgentInput::ActionResult {
-                result: AIAgentActionResult {
-                    id: tool_call_id.into(),
-                    task_id: task_id.clone(),
-                    result: AIAgentActionResultType::StartAgent(start_agent_result),
-                },
-                context,
-            })
-        }
-        Some(ToolCallResultType::StartAgentV2(result)) => {
-            let start_agent_result = match &result.result {
-                Some(api::start_agent_v2_result::Result::Success(success)) => {
-                    StartAgentResult::Success {
-                        agent_id: success.agent_id.clone(),
-                        version: StartAgentVersion::V2,
-                    }
-                }
-                Some(api::start_agent_v2_result::Result::Error(error)) => StartAgentResult::Error {
-                    error: error.error.clone(),
-                    version: StartAgentVersion::V2,
-                },
-                None => StartAgentResult::Cancelled {
-                    version: StartAgentVersion::V2,
-                },
-            };
-
-            Some(AIAgentInput::ActionResult {
-                result: AIAgentActionResult {
-                    id: tool_call_id.into(),
-                    task_id: task_id.clone(),
-                    result: AIAgentActionResultType::StartAgent(start_agent_result),
-                },
-                context,
-            })
-        }
         Some(ToolCallResultType::AskUserQuestion(result)) => {
             let ask_result = match &result.result {
                 Some(warp_multi_agent_api::ask_user_question_result::Result::Success(success)) => {
@@ -1620,6 +1593,7 @@ pub(crate) fn convert_tool_call_result_to_input(
             };
             let run_agents_result = match &result.outcome {
                 Some(api::run_agents_result::Outcome::Launched(launched)) => {
+                    #[allow(deprecated)]
                     let execution_mode = match &launched.resolved_execution_mode {
                         Some(api::run_agents_result::launched::ResolvedExecutionMode::Remote(
                             remote,
@@ -1637,6 +1611,8 @@ pub(crate) fn convert_tool_call_result_to_input(
                         .iter()
                         .map(|outcome| RunAgentsAgentOutcome {
                             name: outcome.name.clone(),
+                            // Proto field is model_id (renamed from resolved_model_id).
+                            resolved_model_id: outcome.model_id.clone(),
                             kind: match &outcome.result {
                                 Some(api::run_agents_result::agent_outcome::Result::Launched(
                                     launched_agent,
@@ -1654,13 +1630,17 @@ pub(crate) fn convert_tool_call_result_to_input(
                             },
                         })
                         .collect();
+                    #[allow(deprecated)]
+                    let model_id = launched.resolved_model_id.clone();
+                    #[allow(deprecated)]
+                    let harness_type =
+                        crate::ai::agent::api::convert_from::convert_run_agents_harness(
+                            launched.resolved_harness.as_ref(),
+                        )
+                        .unwrap_or_default();
                     RunAgentsResult::Launched {
-                        model_id: launched.resolved_model_id.clone(),
-                        harness_type:
-                            crate::ai::agent::api::convert_from::convert_run_agents_harness(
-                                launched.resolved_harness.as_ref(),
-                            )
-                            .unwrap_or_default(),
+                        model_id,
+                        harness_type,
                         execution_mode,
                         agents,
                     }
@@ -1741,6 +1721,9 @@ pub(crate) fn convert_tool_call_result_to_input(
                 }
                 Some(api::stop_recording_result::Result::Error(error)) => {
                     StopRecordingResult::Error(error.message.clone())
+                }
+                Some(api::stop_recording_result::Result::Discarded(_)) => {
+                    StopRecordingResult::Discarded
                 }
                 None => StopRecordingResult::Cancelled,
             };
@@ -1889,16 +1872,6 @@ fn create_cancelled_result_for_tool_call(
             return None;
         }
         ToolType::Subagent(_) => return None,
-        ToolType::StartAgent(_) => {
-            AIAgentActionResultType::StartAgent(StartAgentResult::Cancelled {
-                version: StartAgentVersion::V1,
-            })
-        }
-        ToolType::StartAgentV2(_) => {
-            AIAgentActionResultType::StartAgent(StartAgentResult::Cancelled {
-                version: StartAgentVersion::V2,
-            })
-        }
         ToolType::AskUserQuestion(_) => {
             AIAgentActionResultType::AskUserQuestion(AskUserQuestionResult::Cancelled)
         }

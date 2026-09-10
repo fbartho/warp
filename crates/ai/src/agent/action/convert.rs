@@ -114,6 +114,7 @@ impl From<api::message::tool_call::ApplyFileDiffs> for AIAgentActionType {
             .map(|new_file| FileEdit::Create {
                 file: new_file.file_path.none_if_default(),
                 content: new_file.content.none_if_default(),
+                allow_overwrite: new_file.allow_overwrite,
             });
 
         AIAgentActionType::RequestFileEdits {
@@ -523,6 +524,7 @@ impl TryFrom<api::message::tool_call::StartRecording> for AIAgentActionType {
                 .filter(|&bytes| bytes > 0)
                 .map(|bytes| bytes as u64),
             summary: (!value.summary.trim().is_empty()).then_some(value.summary),
+            description: (!value.description.trim().is_empty()).then_some(value.description),
             playback_speed_multiplier,
             window,
         })
@@ -533,6 +535,9 @@ impl From<api::message::tool_call::StopRecording> for AIAgentActionType {
     fn from(value: api::message::tool_call::StopRecording) -> Self {
         AIAgentActionType::StopRecording {
             recording_id: value.recording_id,
+            // Normalize the wire's `discard` polarity to the internal
+            // `should_persist`; unset `discard` defaults to persist.
+            should_persist: !value.discard,
         }
     }
 }

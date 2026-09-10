@@ -32,8 +32,6 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) left_panel_icon: MouseStateHandle,
     pub(super) settings_icon: MouseStateHandle,
     pub(super) dismiss_banner_button: MouseStateHandle,
-    pub(super) sign_in_button: MouseStateHandle,
-    pub(super) sign_up_button: MouseStateHandle,
     pub(super) offline_icon: MouseStateHandle,
     pub(super) avatar_icon: MouseStateHandle,
     pub(super) header_dimming: MouseStateHandle,
@@ -42,6 +40,7 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) session_config_tab_config_chip_close: MouseStateHandle,
     pub(super) tools_panel_icon: MouseStateHandle,
     pub(super) title_bar_search_bar: MouseStateHandle,
+    pub(super) team_switcher_pill: MouseStateHandle,
     #[cfg(target_family = "wasm")]
     pub(super) warp_logo: MouseStateHandle,
 }

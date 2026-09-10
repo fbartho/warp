@@ -16,7 +16,7 @@ use super::providers::{
 };
 use crate::LLMPreferences;
 use crate::ai::auth_secret_types::auth_secret_types_for_harness;
-use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
+use crate::ai::cloud_environments::{CloudAmbientAgentEnvironment, environment_matches_scope};
 use crate::ai::connected_self_hosted_workers::ConnectedSelfHostedWorkersModel;
 use crate::ai::harness_availability::{AuthSecretFetchState, HarnessAvailabilityModel};
 use crate::ai::harness_display;
@@ -24,6 +24,7 @@ use crate::ai::local_harness_setup::{
     LocalHarnessSetupState, local_harness_is_product_enabled, local_harness_setup_state,
 };
 use crate::cloud_object::CloudObjectLookup as _;
+use crate::workspaces::user_workspaces::TeamScope;
 
 const DEFAULT_MODEL_LABEL: &str = "Default model";
 /// Label shown in the auth secret picker when no secret is selected
@@ -70,6 +71,13 @@ pub enum OptionBadge {
     Default,
     Recent,
     Connected,
+    /// Constructed by `warp_tui` (the TUI ask-question card). The variant
+    /// lives here so both frontends share a single `OptionBadge` type.
+    /// The lint is suppressed because the construction site is in the
+    /// downstream `warp_tui` crate, which is invisible to clippy when
+    /// linting `warp` in isolation.
+    #[allow(dead_code)]
+    Recommended,
 }
 
 /// Load state of the catalog backing a snapshot.
@@ -287,32 +295,7 @@ pub fn model_snapshot(state: &OrchestrationConfigState, ctx: &AppContext) -> Opt
     let is_local = !state.execution_mode.is_remote();
     let harness = Harness::parse_orchestration_harness(&state.harness_type);
     match harness {
-        Some(Harness::Oz) | None => {
-            // Oz / unset: Warp LLM catalog. Custom models excluded for
-            // cloud runs (not supported by remote workers).
-            // Order: auto models first, then custom models, then other models.
-            let llm_prefs = LLMPreferences::as_ref(ctx);
-            let (auto_models, rest): (Vec<_>, Vec<_>) =
-                get_base_model_choices(llm_prefs, ctx, is_local)
-                    .partition(|llm| llm.id.as_str().starts_with("auto"));
-            let (custom_models, other_models): (Vec<_>, Vec<_>) = rest
-                .into_iter()
-                .partition(|llm| llm_prefs.custom_llm_info_for_id(&llm.id).is_some());
-            let choices: Vec<ModelChoiceInput> = auto_models
-                .into_iter()
-                .chain(custom_models)
-                .chain(other_models)
-                .map(|llm| ModelChoiceInput {
-                    id: llm.id.to_string(),
-                    label: llm.menu_display_name(),
-                    disabled_reason: llm
-                        .disable_reason
-                        .as_ref()
-                        .map(|reason| reason.tooltip_text().to_string()),
-                })
-                .collect();
-            build_oz_model_snapshot(choices, &state.model_id)
-        }
+        Some(Harness::Oz) | None => oz_model_snapshot(&state.model_id, is_local, ctx),
         Some(Harness::Codex) if is_local => {
             // Local Codex: only "Default model" entry.
             OptionSnapshot::ready(
@@ -336,6 +319,39 @@ pub fn model_snapshot(state: &OrchestrationConfigState, ctx: &AppContext) -> Opt
             build_non_oz_model_snapshot(models, &state.model_id)
         }
     }
+}
+
+/// Builds the Oz model options available for the requested execution location.
+///
+/// Local execution includes custom models backed by local endpoints. Cloud
+/// execution excludes them because remote workers cannot reach those endpoints.
+pub fn oz_model_snapshot(
+    selected_model_id: &str,
+    is_local: bool,
+    ctx: &AppContext,
+) -> OptionSnapshot {
+    // Oz / unset: Warp LLM catalog. Custom models are excluded for cloud
+    // execution because remote workers cannot use local custom endpoints.
+    let llm_prefs = LLMPreferences::as_ref(ctx);
+    let (auto_models, rest): (Vec<_>, Vec<_>) = get_base_model_choices(llm_prefs, ctx, is_local)
+        .partition(|llm| llm.id.as_str().starts_with("auto"));
+    let (custom_models, other_models): (Vec<_>, Vec<_>) = rest
+        .into_iter()
+        .partition(|llm| llm_prefs.custom_llm_info_for_id(&llm.id).is_some());
+    let choices = auto_models
+        .into_iter()
+        .chain(custom_models)
+        .chain(other_models)
+        .map(|llm| ModelChoiceInput {
+            id: llm.id.to_string(),
+            label: llm.menu_display_name(),
+            disabled_reason: llm
+                .disable_reason
+                .as_ref()
+                .map(|reason| reason.tooltip_text().to_string()),
+        })
+        .collect();
+    build_oz_model_snapshot(choices, selected_model_id)
 }
 
 /// Pure core for the Oz / unset branch of [`model_snapshot`].
@@ -403,14 +419,18 @@ enum AuthSecretNamesInput {
 /// managed-secret names. Secret values are never included — names only.
 /// Status mirrors `AuthSecretFetchState`; the `CreateNewAuthSecret`
 /// footer is emitted for harnesses with managed-secret types.
-pub fn api_key_snapshot(state: &OrchestrationConfigState, ctx: &AppContext) -> OptionSnapshot {
+pub fn api_key_snapshot<S: TeamScope + ?Sized>(
+    state: &OrchestrationConfigState,
+    team_scope: &S,
+    ctx: &AppContext,
+) -> OptionSnapshot {
     let Some(harness) = Harness::parse_orchestration_harness(&state.harness_type) else {
         return OptionSnapshot::ready(Vec::new(), None);
     };
     if harness == Harness::Oz {
         return OptionSnapshot::ready(Vec::new(), None);
     }
-    let names = match HarnessAvailabilityModel::as_ref(ctx).auth_secrets_for(harness) {
+    let names = match HarnessAvailabilityModel::as_ref(ctx).auth_secrets_for(team_scope, harness) {
         AuthSecretFetchState::Loaded(secrets) => {
             AuthSecretNamesInput::Loaded(secrets.iter().map(|s| s.name.clone()).collect())
         }
@@ -460,14 +480,18 @@ fn build_api_key_snapshot(
 
 // ── Host ────────────────────────────────────────────────────────────
 
-/// Builds the host options in the GUI host picker's order: workspace
+/// Builds the host options in the GUI host picker's order: `scope`'s team
 /// default (badged), warp, connected worker hosts (badged), the recent
 /// custom slug (badged), then a custom-host text-entry footer.
-pub fn host_snapshot(state: &OrchestrationConfigState, ctx: &AppContext) -> OptionSnapshot {
-    let default_host = resolve_default_host_slug(ctx);
-    let recent_host = resolve_recent_host_slug(ctx);
+pub fn host_snapshot<S: TeamScope + ?Sized>(
+    state: &OrchestrationConfigState,
+    scope: &S,
+    ctx: &AppContext,
+) -> OptionSnapshot {
+    let default_host = resolve_default_host_slug(scope, ctx);
+    let recent_host = resolve_recent_host_slug(scope, ctx);
     let mut connected_hosts = ConnectedSelfHostedWorkersModel::as_ref(ctx)
-        .worker_hosts_excluding(default_host.as_deref());
+        .worker_hosts_excluding(scope, default_host.as_deref());
     connected_hosts.sort();
     connected_hosts.dedup();
     let current = match &state.execution_mode {
@@ -541,12 +565,17 @@ fn build_host_snapshot(
 
 // ── Environment ─────────────────────────────────────────────────────
 
-/// Builds the environment options: "Empty environment" plus existing
-/// environments sorted by name, mirroring the GUI environment picker.
-pub fn environment_snapshot(state: &OrchestrationConfigState, ctx: &AppContext) -> OptionSnapshot {
+/// Builds the environment options: "Empty environment" plus personal and
+/// current-team environments sorted by name.
+pub fn environment_snapshot<S: TeamScope + ?Sized>(
+    state: &OrchestrationConfigState,
+    scope: &S,
+    ctx: &AppContext,
+) -> OptionSnapshot {
     let all_envs = CloudAmbientAgentEnvironment::get_all(ctx);
     let mut sorted_envs: Vec<(String, String)> = all_envs
         .iter()
+        .filter(|environment| environment_matches_scope(environment, scope, true))
         .map(|env| (env.id.uid(), env.model().string_model.name.clone()))
         .collect();
     sorted_envs.sort_by(|a, b| a.1.cmp(&b.1));

@@ -84,6 +84,7 @@ use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
 use crate::ai::blocklist::inline_action::ask_user_question_view::AskUserQuestionView;
 use crate::ai::blocklist::inline_action::aws_bedrock_credentials_error::AwsBedrockCredentialsErrorView;
 use crate::ai::blocklist::inline_action::create_or_edit_document::CreateOrEditDocumentAction;
+use crate::ai::blocklist::inline_action::gemini_enterprise_credentials_error::GeminiEnterpriseCredentialsErrorView;
 use crate::ai::blocklist::inline_action::inline_action_header::{
     HeaderConfig, INLINE_ACTION_HEADER_VERTICAL_PADDING, INLINE_ACTION_HORIZONTAL_PADDING,
     InteractionMode,
@@ -102,7 +103,9 @@ use crate::ai::blocklist::inline_action::web_search::WebSearchView;
 use crate::ai::blocklist::keyboard_navigable_buttons::KeyboardNavigableButtons;
 use crate::ai::blocklist::secret_redaction::SecretRedactionState;
 use crate::ai::blocklist::usage::rollup::compute_orchestration_rollup;
-use crate::ai::blocklist::view_util::format_credits;
+use crate::ai::blocklist::view_util::{
+    FAILED_OUTPUT_USAGE_NOTICE_TEXT, format_usage, should_show_failed_output_usage_notice,
+};
 use crate::ai::blocklist::{AIBlockResponseRating, BlocklistAIActionModel, SuggestionChipView};
 use crate::ai::paths::shell_native_absolute_path;
 use crate::ai::skills::{
@@ -112,6 +115,7 @@ use crate::ai::skills::{
 use crate::appearance::Appearance;
 use crate::code::diff_viewer::DisplayMode;
 use crate::code::editor_management::CodeSource;
+use crate::settings::AISettings;
 use crate::settings_view::SettingsSection;
 use crate::terminal::ShellLaunchData;
 #[cfg(not(target_family = "wasm"))]
@@ -187,6 +191,8 @@ pub(crate) struct Props<'a> {
     pub(super) is_cloud_agent_context: bool,
     pub(super) aws_bedrock_credentials_error_view:
         Option<&'a ViewHandle<AwsBedrockCredentialsErrorView>>,
+    pub(super) gemini_enterprise_credentials_error_view:
+        Option<&'a ViewHandle<GeminiEnterpriseCredentialsErrorView>>,
     pub(super) imported_comments: &'a HashMap<AIAgentActionId, ImportedCommentGroup>,
     /// Per-orchestrate-action card view. Each `RunAgentsCardView` owns
     /// its own edit state, button + picker handles, and in-flight
@@ -256,21 +262,15 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
         | AIBlockOutputStatus::Failed { .. } => {
             if let Some(output) = status.output_to_render() {
                 let output = output.get();
-                // TODO(vkodithala): Blocks with recording-related actions still
-                // recompute this conversation-wide map on every render. Cache
-                // spans on BlocklistAIActionModel keyed by conversation and
-                // refresh on action/result mutations instead.
                 let recording_spans_by_action_id = if props.has_recording_related_actions {
-                    props
-                        .model
-                        .conversation(app)
-                        .map(|conversation| {
-                            conversation
-                                .recording_spans_by_action_id(Some(props.action_model.as_ref(app)))
-                        })
-                        .unwrap_or_default()
+                    props.model.conversation(app).map(|conversation| {
+                        props
+                            .action_model
+                            .as_ref(app)
+                            .recording_spans_for_conversation(conversation)
+                    })
                 } else {
-                    HashMap::new()
+                    None
                 };
                 let is_complete = matches!(status, AIBlockOutputStatus::Complete { .. });
                 let is_output_for_static_prompt_suggestions =
@@ -776,7 +776,9 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                                 props,
                                 id,
                                 request,
-                                recording_spans_by_action_id.get(id),
+                                recording_spans_by_action_id
+                                    .as_ref()
+                                    .and_then(|spans| spans.get(id)),
                                 app,
                             ));
                         }
@@ -830,30 +832,6 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                             should_render_footer = false;
                             output_items
                                 .add_child(render_request_computer_use(props, id, request, app));
-                        }
-                        AIAgentOutputMessageType::Action(AIAgentAction {
-                            action:
-                                AIAgentActionType::StartAgent {
-                                    version: _,
-                                    name,
-                                    prompt,
-                                    execution_mode,
-                                    lifecycle_subscription: _,
-                                },
-                            id,
-                            ..
-                        }) => {
-                            should_render_footer = false;
-                            should_render_suggestions = false;
-                            output_items.add_child(orchestration::render_start_agent(
-                                props,
-                                id,
-                                name,
-                                prompt,
-                                execution_mode,
-                                &output_message.id,
-                                app,
-                            ));
                         }
                         AIAgentOutputMessageType::Action(AIAgentAction {
                             action: AIAgentActionType::RunAgents(_req),
@@ -1244,6 +1222,8 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                         subscribe_button_handle: &props.state_handles.subscribe_button_handle,
                         aws_bedrock_credentials_error_view: props
                             .aws_bedrock_credentials_error_view,
+                        gemini_enterprise_credentials_error_view: props
+                            .gemini_enterprise_credentials_error_view,
                         icon_right_margin: 16.,
                     },
                     app,
@@ -1252,18 +1232,16 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                 .finish(),
             );
 
-            if props.model.is_latest_visible_exchange_in_root_task(app)
-                && !has_expanded_last_requested_command
-                && !props.model.is_restored()
-                && !error.is_invalid_api_key()
-            {
+            if should_show_failed_output_usage_notice(
+                error,
+                props.model.is_latest_visible_exchange_in_root_task(app),
+                has_expanded_last_requested_command,
+                props.model.is_restored(),
+            ) {
                 output_items.add_child(
-                    render_informational_footer(
-                        app,
-                        "This response won't count towards your usage.".to_string(),
-                    )
-                    .with_agent_output_item_spacing(app)
-                    .finish(),
+                    render_informational_footer(app, FAILED_OUTPUT_USAGE_NOTICE_TEXT.to_string())
+                        .with_agent_output_item_spacing(app)
+                        .finish(),
                 );
 
                 output_items.add_child(
@@ -3066,6 +3044,10 @@ fn stop_recording_card_text(result: Option<&StopRecordingResult>) -> RecordingCa
                 subtext: None,
             }
         }
+        Some(StopRecordingResult::Discarded) => RecordingCardText {
+            primary: "Recording discarded".to_string(),
+            subtext: None,
+        },
         None => RecordingCardText {
             primary: "Saving recording".to_string(),
             subtext: None,
@@ -3218,7 +3200,8 @@ fn render_use_computer(
             renderable_action.with_footer(render_recording_footer(recording_span.status, app));
     }
 
-    // Add a "View screenshot" button if the action result contains a screenshot.
+    // Add a "View screenshot" button if the action result contains a screenshot,
+    // either inline or offloaded to object storage.
     let has_screenshot = props
         .action_model
         .as_ref(app)
@@ -3227,8 +3210,11 @@ fn render_use_computer(
             matches!(
                 &result.result,
                 AIAgentActionResultType::UseComputer(
-                    crate::ai::agent::UseComputerResult::Success(action_result)
-                ) if action_result.screenshot.is_some()
+                    crate::ai::agent::UseComputerResult::Success {
+                        screenshot: Some(_),
+                        ..
+                    }
+                )
             )
         });
 
@@ -3708,6 +3694,21 @@ fn render_usage_button(props: Props, app: &AppContext) -> Box<dyn Element> {
         .as_ref()
         .map(|r| r.total_credits)
         .unwrap_or_else(|| conversation.credits_spent());
+    // Only the rollup path (summed across sub-agents) has a matching
+    // aggregated cost figure; a non-orchestrator conversation's own dollar
+    // cost comes from its usage totals directly.
+    let headline_cost_in_cents = rollup
+        .as_ref()
+        .map(|r| r.total_cost_in_cents)
+        .unwrap_or_else(|| conversation.usage_totals().total_cost_in_cents());
+    // Same rollup-vs-own-totals split as `headline_cost_in_cents`, for the
+    // token count shown alongside it.
+    let headline_tokens = rollup.as_ref().map(|r| r.total_tokens).unwrap_or_else(|| {
+        conversation
+            .usage_totals()
+            .charged_usage
+            .map(|usage| usage.total_tokens())
+    });
     let has_any_usage = headline_credits > 0.0
         || conversation.credits_spent_for_last_block().is_some()
         || !conversation.token_usage().is_empty()
@@ -3725,8 +3726,14 @@ fn render_usage_button(props: Props, app: &AppContext) -> Box<dyn Element> {
         Icon::ChevronRight
     };
 
+    let usage_display_unit = AISettings::as_ref(app).usage_display_unit;
     let total_credits_spent = headline_credits;
-    let mut credit_usage_text = format_credits(total_credits_spent);
+    let mut usage_text = format_usage(
+        total_credits_spent,
+        headline_tokens,
+        headline_cost_in_cents,
+        usage_display_unit,
+    );
     if let Some(credits_spent_for_last_block) = conversation.credits_spent_for_last_block() {
         // Only show the credits spent for the last block if it is different from the total credits spent
         // and we spent a non-zero amount of credits for the last block.
@@ -3736,16 +3743,17 @@ fn render_usage_button(props: Props, app: &AppContext) -> Box<dyn Element> {
             && total_credits_spent != credits_spent_for_last_block
             && props.model.status(app).error().is_none()
         {
-            // If the first part of the decimal is 0, we just display the whole number.
-            if credits_spent_for_last_block.fract() < 0.1 {
-                credit_usage_text = format!(
-                    "{credit_usage_text} (+{})",
-                    credits_spent_for_last_block.trunc() as i32
-                );
-            } else {
-                credit_usage_text =
-                    format!("{credit_usage_text} (+{credits_spent_for_last_block:.1})");
-            }
+            // The last-block figure has no rollup equivalent: it stays
+            // bound to the orchestrator's own last block, same as
+            // `credits_spent_for_last_block` above.
+            let last_block_charged_usage = conversation.charged_usage_for_last_block();
+            let last_block_text = format_usage(
+                credits_spent_for_last_block,
+                last_block_charged_usage.map(|usage| usage.total_tokens()),
+                last_block_charged_usage.map(|usage| usage.total_cost_in_cents()),
+                usage_display_unit,
+            );
+            usage_text = format!("{usage_text} (+{last_block_text})");
         }
     }
 
@@ -3756,7 +3764,7 @@ fn render_usage_button(props: Props, app: &AppContext) -> Box<dyn Element> {
         .with_child(
             Container::new(
                 Text::new_inline(
-                    credit_usage_text,
+                    usage_text,
                     appearance.ui_font_family(),
                     appearance.monospace_font_size(),
                 )
@@ -4017,7 +4025,6 @@ fn render_collapsible_text_block_section(
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let text_color = blended_colors::text_disabled(theme, theme.surface_2());
-    let selectable = false;
     let is_streaming = props.model.status(app).is_streaming();
 
     let mut container = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
@@ -4050,7 +4057,7 @@ fn render_collapsible_text_block_section(
             starting_image_section_index: &mut image_section_index,
             sections,
             text_color,
-            selectable,
+            selectable: true,
             find_context: props.find_context,
             current_working_directory: props.current_working_directory,
             shell_launch_data: props.shell_launch_data,

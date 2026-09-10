@@ -23,6 +23,7 @@ use crate::integration_testing::step::{
 };
 use crate::integration_testing::terminal::assert_input_is_focused;
 use crate::integration_testing::view_getters::terminal_view;
+use crate::workspaces::user_workspaces::{ResolvedTeamScope, UserWorkspaces};
 
 pub const AGENT_MODE_RUNNING_STEP_GROUP_NAME: &str = "Agent mode running";
 
@@ -330,14 +331,36 @@ pub fn set_preferred_agent_mode_llm(llm_id: &str) -> TestStep {
             let llm_id = llm_id.clone();
             let terminal_view_id = terminal_view(app, window_id, 0, 0).id();
             LLMPreferences::handle(app).update(app, |llm_preferences, ctx| {
+                let scope = ResolvedTeamScope::from_scope(
+                    &UserWorkspaces::as_ref(ctx).team_context_for_window(window_id),
+                );
                 // Validate that the LLM ID is actually available. We only do this
                 // for the base model, since the coding and planning models are
                 // currently unused in the product.
+                //
+                // When the model list itself is unavailable (the server is
+                // unhealthy and the list never populated), surface that as the
+                // failure reason instead of blaming the requested id — otherwise
+                // every id is deemed "not a valid agent mode LLM", hiding the
+                // real server-availability issue.
+                let available = llm_preferences.is_available_agent_mode_llm(&scope, &llm_id, ctx);
                 assert!(
-                    llm_preferences.is_available_agent_mode_llm(&llm_id),
-                    "LLM ID '{llm_id}' is not a valid agent mode LLM",
+                    available,
+                    "{}",
+                    if !available && llm_preferences.agent_mode_models_unavailable(&scope) {
+                        format!(
+                            "Agent-mode model list is unavailable from the server (it may be unhealthy); cannot validate LLM ID '{llm_id}'"
+                        )
+                    } else {
+                        format!("LLM ID '{llm_id}' is not a valid agent mode LLM")
+                    }
                 );
-                llm_preferences.update_preferred_agent_mode_llm(&llm_id, terminal_view_id, ctx);
+                llm_preferences.update_preferred_agent_mode_llm(
+                    &scope,
+                    &llm_id,
+                    terminal_view_id,
+                    ctx,
+                );
             });
             async_assert!(true, "Successfully updated preferred agent mode LLM")
         },
@@ -353,7 +376,15 @@ pub fn set_preferred_coding_llm(llm_id: &str) -> TestStep {
             let llm_id = llm_id.clone();
             let terminal_view_id = terminal_view(app, window_id, 0, 0).id();
             LLMPreferences::handle(app).update(app, |llm_preferences, ctx| {
-                llm_preferences.update_preferred_coding_llm(&llm_id, Some(terminal_view_id), ctx);
+                let scope = ResolvedTeamScope::from_scope(
+                    &UserWorkspaces::as_ref(ctx).team_context_for_window(window_id),
+                );
+                llm_preferences.update_preferred_coding_llm(
+                    &scope,
+                    &llm_id,
+                    Some(terminal_view_id),
+                    ctx,
+                );
             });
             async_assert!(true, "Successfully updated preferred coding LLM")
         },
@@ -376,9 +407,9 @@ pub fn set_execution_profile_no_auto_execute() -> TestStep {
         "Update execution profile",
         |app, _window_id| {
             AIExecutionProfilesModel::handle(app).update(app, |profiles, ctx| {
-                let default_profile_id = *profiles.default_profile(ctx).id();
+                let default_profile_id = profiles.default_profile_id();
                 profiles.set_execute_commands(
-                    default_profile_id,
+                    &default_profile_id,
                     &ActionPermission::AlwaysAsk,
                     ctx,
                 );

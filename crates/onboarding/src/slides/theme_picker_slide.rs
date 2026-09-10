@@ -24,7 +24,6 @@ use crate::OnboardingIntention;
 use crate::model::{OnboardingStateEvent, OnboardingStateModel};
 use crate::slides::{bottom_nav, layout, slide_content};
 use crate::telemetry::OnboardingEvent;
-use crate::visuals::theme_picker_visual;
 
 #[derive(Debug, Clone)]
 pub enum ThemePickerSlideEvent {
@@ -163,11 +162,11 @@ impl ThemePickerSlide {
             theme_options
         };
 
-        let mut content = vec![self.render_header_text(appearance), theme_options_section];
-
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
-            content.push(self.render_sync_with_os_section(appearance));
-        }
+        let mut content = vec![
+            self.render_header_text(appearance),
+            theme_options_section,
+            self.render_sync_with_os_section(appearance),
+        ];
 
         // Add the Privacy Settings / Terms of Service disclaimer block below the
         // theme options when the user has selected the terminal intention and
@@ -178,8 +177,7 @@ impl ThemePickerSlide {
         let state = self.onboarding_state.as_ref(app);
         let is_terminal = matches!(state.intention(), OnboardingIntention::Terminal);
         let warp_drive_enabled = state.ui_customization().show_warp_drive;
-        if is_terminal && !warp_drive_enabled && FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-        {
+        if !FeatureFlag::AccountFirstOnboarding.is_enabled() && is_terminal && !warp_drive_enabled {
             content.push(self.render_disclaimer_section(appearance));
         }
 
@@ -272,12 +270,8 @@ impl ThemePickerSlide {
             },
         );
 
-        let theme_picker_last = FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
-        let next_label = if theme_picker_last {
-            "Get Warping"
-        } else {
-            "Next"
-        };
+        let account_first = FeatureFlag::AccountFirstOnboarding.is_enabled();
+        let next_label = if account_first { "Next" } else { "Get Warping" };
 
         let enter = Keystroke::parse("enter").unwrap_or_default();
         let next_button = self.next_button.render(
@@ -295,14 +289,14 @@ impl ThemePickerSlide {
             },
         );
 
-        let (step_index, step_count) = if theme_picker_last {
+        let (step_index, step_count) = if account_first {
+            self.onboarding_state.as_ref(app).progress()
+        } else {
             let is_terminal = matches!(
                 self.onboarding_state.as_ref(app).intention(),
                 OnboardingIntention::Terminal
             );
             if is_terminal { (3, 4) } else { (4, 5) }
-        } else {
-            (0, 4)
         };
 
         bottom_nav::onboarding_bottom_nav(
@@ -478,17 +472,9 @@ impl ThemePickerSlide {
             .unwrap_or(&Self::VISUAL_IMAGE_PATHS[0])
     }
 
-    fn render_theme_picker_visual(
-        &self,
-        appearance: &Appearance,
-        app: &AppContext,
-    ) -> Box<dyn Element> {
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
-            let path = self.theme_visual_path(app);
-            layout::onboarding_right_panel_with_bg(path, layout::FOREGROUND_LAYOUT_DEFAULT)
-        } else {
-            theme_picker_visual(appearance)
-        }
+    fn render_theme_picker_visual(&self, app: &AppContext) -> Box<dyn Element> {
+        let path = self.theme_visual_path(app);
+        layout::onboarding_right_panel_with_bg(path, layout::FOREGROUND_LAYOUT_DEFAULT)
     }
 }
 
@@ -507,7 +493,7 @@ impl View for ThemePickerSlide {
         // Background is rendered by the parent onboarding view (including background images).
         layout::static_left(
             || self.render_theme_picker_content(appearance, app),
-            || self.render_theme_picker_visual(appearance, app),
+            || self.render_theme_picker_visual(app),
         )
     }
 }
@@ -648,11 +634,7 @@ impl ThemePickerSlide {
 
     fn next(&mut self, ctx: &mut ViewContext<Self>) {
         self.onboarding_state.update(ctx, |model, ctx| {
-            if FeatureFlag::OpenWarpNewSettingsModes.is_enabled() {
-                model.complete(ctx);
-            } else {
-                model.next(ctx);
-            }
+            model.complete(ctx);
         });
     }
 }

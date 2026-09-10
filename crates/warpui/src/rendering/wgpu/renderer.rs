@@ -4,6 +4,8 @@ mod image;
 mod rect;
 mod util;
 
+use std::sync::atomic::Ordering;
+
 use frame::Frame;
 use pathfinder_geometry::vector::Vector2F;
 use util::with_error_scope;
@@ -80,6 +82,12 @@ impl Renderer {
             return Ok(());
         }
 
+        // Surface acquisition can degrade to persistent validation errors after the device-lost
+        // callback fires, which bypasses the event loop's renderer-recovery branch.
+        if resources.device_lost.load(Ordering::SeqCst) {
+            return Err(Error::DeviceLost);
+        }
+
         let mut ctx = WGPUContext {
             resources,
             rasterize_glyph_fn,
@@ -125,7 +133,7 @@ impl Renderer {
                 // wgpu will print out an error that we attempted to present a
                 // texture without submitting any work to the GPU.
                 match with_error_scope(device, || {
-                    surface_texture.present();
+                    queue.present(surface_texture);
                 }) {
                     (_, None) => Ok(()),
                     (_, Some(error)) => Err(error),
@@ -140,6 +148,8 @@ impl Renderer {
 pub enum Error {
     #[error("Device was lost")]
     DeviceLost,
+    #[error("Failed to map buffer range: {0}")]
+    BufferMap(#[from] wgpu::MapRangeError),
     #[error("Failed to acquire surface texture: {0:#}")]
     SurfaceError(#[from] GetSurfaceTextureError),
     #[error("Failed to configure surface: {0:#}")]
@@ -253,7 +263,9 @@ fn capture_surface_texture(
 
     map_result?;
 
-    let data = buffer_slice.get_mapped_range();
+    let data = buffer_slice
+        .get_mapped_range()
+        .map_err(|e| format!("Failed to get mapped range: {e}"))?;
     let mut rgba_data = Vec::with_capacity((width * height * bytes_per_pixel) as usize);
     for row in 0..height {
         let start = (row * padded_bytes_per_row) as usize;
