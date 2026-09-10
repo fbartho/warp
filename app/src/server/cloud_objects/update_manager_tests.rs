@@ -410,7 +410,11 @@ async fn wait_for_trashed_status_for_object(app: &mut App, uid: &ObjectUid, is_t
         }
     };
 
-    if poll.with_timeout(TRASHED_STATUS_WAIT_CEILING).await.is_err() {
+    if poll
+        .with_timeout(TRASHED_STATUS_WAIT_CEILING)
+        .await
+        .is_err()
+    {
         // Timed out: fall through to the normal assertion helper for a clear failure message.
         assert_trashed_status_for_object(app, uid, is_trashed);
     }
