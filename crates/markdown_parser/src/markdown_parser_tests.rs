@@ -3102,6 +3102,18 @@ fn test_parse_html_comment_multi_line_block_is_stripped() {
 }
 
 #[test]
+fn test_parse_unterminated_html_comment_stays_literal() {
+    // Per CommonMark, an unterminated `<!--` is not a comment, so it renders as text.
+    let source = "<!-- never closed\n";
+    assert_eq!(
+        test_parse_markdown(source),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text("<!-- never closed")
+        ])]
+    );
+}
+
+#[test]
 fn test_br_inside_underline_keeps_underline_across_break() {
     let fragments = parse_single_line_fragments("<u>a<br>b</u>");
     let joined: String = fragments.iter().map(|f| f.text.as_str()).collect();
