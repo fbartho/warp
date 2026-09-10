@@ -912,9 +912,7 @@ fn measured_cell_texts(text_layout: &TextLayout<'_>, content: &str) -> Vec<Vec<S
 fn test_measure_table_cells_trailing_br_keeps_newline() {
     App::test((), |app| async move {
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -940,9 +938,7 @@ fn test_measure_table_cells_trailing_br_keeps_newline() {
 fn test_measure_table_cells_lone_br_keeps_newline() {
     App::test((), |app| async move {
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -960,9 +956,7 @@ fn test_measure_table_cells_lone_br_keeps_newline() {
 fn test_measure_table_cells_embedded_br_unchanged() {
     App::test((), |app| async move {
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -986,9 +980,7 @@ fn test_measure_table_cells_embedded_br_unchanged() {
 fn test_measure_table_cells_style_boundary_br_keeps_newline() {
     App::test((), |app| async move {
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
@@ -1012,9 +1004,7 @@ fn test_measure_table_cells_style_boundary_br_keeps_newline() {
 fn test_measure_table_cells_style_boundary_and_trailing_br() {
     App::test((), |app| async move {
         app.read(|ctx| {
-            let layout_cache = LayoutCache::new();
             let text_layout = TextLayout::new(
-                &layout_cache,
                 ctx.font_cache().text_layout_system(),
                 &TEST_STYLES,
                 f32::MAX,
