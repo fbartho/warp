@@ -80,6 +80,7 @@ pub async fn generate_multi_agent_output(
             use_anthropic_text_editor_tools: false,
             planning_enabled: params.planning_enabled,
             supports_create_files: true,
+            supports_create_file_overwrite: true,
             supported_tools: supported_tools.into_iter().map(Into::into).collect(),
             supports_long_running_commands: true,
             should_preserve_file_content_in_history: true,
@@ -107,6 +108,7 @@ pub async fn generate_multi_agent_output(
                 && FeatureFlag::CloudAgentRunners.is_enabled(),
             supports_background_computer_use: FeatureFlag::BackgroundComputerUse.is_enabled()
                 && computer_use::background_supported(),
+            supports_stored_screenshots: FeatureFlag::StoredScreenshots.is_enabled(),
             custom_model_providers: params.custom_model_providers,
             custom_model_routers: params.custom_model_routers,
         }),
