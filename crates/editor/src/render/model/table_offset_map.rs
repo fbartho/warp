@@ -361,12 +361,19 @@ impl TableCellOffsetMap {
                 if segment.is_empty() {
                     // An empty segment is a break with no visible text on this side of it
                     // (a leading `<br>`, a trailing `<br>`, or one of a `<br><br>` run).
-                    // At this point `source_idx` sits just past the `<br>` token that produced
-                    // the preceding break — i.e. at the source boundary *before* the next
-                    // `<br>` token. Record a zero-length range there so every `<br>` owns a
+                    // Its boundary is the start of the `<br>` token that follows, which may sit
+                    // past closing Markdown markers when a style run ends at the break (e.g.
+                    // `**a**<br>b`). Record a zero-length range there so every `<br>` owns a
                     // distinct source boundary; without it, the `rendered_to_source` gap lookup
-                    // collapses consecutive or edge breaks onto a neighbouring fragment.
-                    let boundary = CharOffset::from(source_idx);
+                    // collapses consecutive or edge breaks onto a neighbouring fragment or lands
+                    // inside the closing markers.
+                    let mut boundary_idx = source_idx;
+                    while boundary_idx < total_source_chars
+                        && br_token_len_at(&source_chars, boundary_idx).is_none()
+                    {
+                        boundary_idx += 1;
+                    }
+                    let boundary = CharOffset::from(boundary_idx);
                     fragment_ranges.push(TableCellFragmentRange {
                         rendered_start: rendered_offset,
                         rendered_end: rendered_offset,

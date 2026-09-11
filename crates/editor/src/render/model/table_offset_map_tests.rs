@@ -329,6 +329,13 @@ fn test_table_cell_offset_map_maps_br_at_style_boundary() {
         map.source_length(),
         CharOffset::from(source.chars().count())
     );
+    // The break at rendered offset 1 must map to source offset 5 — the boundary before the
+    // `<br>` token — not to offset 3, which sits inside the closing `**`.
+    assert_eq!(
+        map.rendered_to_source(CharOffset::from(1)),
+        CharOffset::from(5),
+        "the break must map past the closing ** to the boundary before <br>",
+    );
     // Rendered 'b' is at rendered offset 2 and source offset 9 (after `**a**<br>`).
     assert_eq!(
         map.rendered_to_source(CharOffset::from(2)),
@@ -337,6 +344,71 @@ fn test_table_cell_offset_map_maps_br_at_style_boundary() {
     assert_eq!(
         map.source_to_rendered(CharOffset::from(9)),
         CharOffset::from(2),
+    );
+}
+
+#[test]
+fn test_table_cell_offset_map_br_after_emphasis_and_code_spans() {
+    // Every closing marker shape must be skipped when the break begins a fragment: emphasis
+    // (`_a_`), inline code (`` `a` ``), and a bold run closing before a trailing break.
+    for (source, break_rendered_offset, expected_source) in [
+        ("_a_<br>b", 1usize, 3usize),
+        ("`a`<br>b", 1, 3),
+        ("**a**<br>", 1, 5),
+    ] {
+        let inline = parse_inline_markdown(source);
+        let map = TableCellOffsetMap::from_inline_and_source(source, &inline);
+        assert_eq!(
+            map.rendered_to_source(CharOffset::from(break_rendered_offset)),
+            CharOffset::from(expected_source),
+            "break in {source:?} should map to the boundary before its <br>",
+        );
+    }
+}
+
+#[test]
+fn test_table_cell_offset_map_br_inside_style_run_keeps_boundary() {
+    // `**a<br>b**` keeps both sides inside one bold run, so the break is mid-fragment rather
+    // than fragment-leading. Its boundary is source offset 3, immediately before `<br>`.
+    let source = "**a<br>b**";
+    let inline = parse_inline_markdown(source);
+    let rendered_text: String = inline.iter().map(|f| f.text.as_str()).collect();
+    assert_eq!(rendered_text, "a\nb");
+
+    let map = TableCellOffsetMap::from_inline_and_source(source, &inline);
+    assert_eq!(
+        map.rendered_to_source(CharOffset::from(1)),
+        CharOffset::from(3),
+    );
+    assert_eq!(
+        map.rendered_to_source(CharOffset::from(2)),
+        CharOffset::from(7),
+    );
+}
+
+#[test]
+fn test_table_cell_offset_map_consecutive_br_after_style_run() {
+    // `**a**<br><br>b` combines the style-boundary break with a `<br><br>` run: the first
+    // break must skip the closing `**` to source 5, and the second must own source 9.
+    let source = "**a**<br><br>b";
+    let inline = parse_inline_markdown(source);
+    let rendered_text: String = inline.iter().map(|f| f.text.as_str()).collect();
+    assert_eq!(rendered_text, "a\n\nb");
+
+    let map = TableCellOffsetMap::from_inline_and_source(source, &inline);
+    assert_eq!(
+        map.rendered_to_source(CharOffset::from(1)),
+        CharOffset::from(5),
+        "first break maps past the closing ** to the first <br>",
+    );
+    assert_eq!(
+        map.rendered_to_source(CharOffset::from(2)),
+        CharOffset::from(9),
+        "second break maps to the second <br>",
+    );
+    assert_eq!(
+        map.rendered_to_source(CharOffset::from(3)),
+        CharOffset::from(13),
     );
 }
 
